@@ -10,6 +10,8 @@
 #include <map>
 #include <vector>
 
+#define DEBUG_TYPE "psdswp"
+
 using namespace llvm;
 
 namespace {
@@ -63,7 +65,7 @@ namespace {
     TNode& getNode(int n) { return nodes[n]; }
 
     void addEdge(int src, int dst, TEdge edge) {
-      std::map<int, TEdge>& nodeEdges = edges[src];
+      std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
 
       auto f = nodeEdges.find(dst);
       if (f != nodeEdges.end()) {
@@ -89,7 +91,7 @@ static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&);
 static DAG computeDAGscc(PDG);
 
 bool PS_DSWP::runOnFunction(Function &F) {
-  errs() << "Running PS-DSWP on function " << F.getName() << "!\n";
+  LLVM_DEBUG(errs() << "Running PS-DSWP on function " << F.getName() << "!\n");
   
   bool modified = false; // Tracks whether we modified the function
 
@@ -100,7 +102,7 @@ bool PS_DSWP::runOnFunction(Function &F) {
   // For now, just considering the top level loops. Not actually sure if this
   // is correct behavior in general
   for (Loop* loop : LI.getTopLevelLoops()) {
-    errs() << "\tRunning on loop " << *loop << "\n";
+    LLVM_DEBUG(errs() << "\tRunning on loop " << *loop << "\n");
     PDG pdg = generatePDG(loop, LI, DI);
     DAG dag_scc = computeDAGscc(pdg);
     // TODO
@@ -109,20 +111,38 @@ bool PS_DSWP::runOnFunction(Function &F) {
   return modified;
 }
 
+// Determines whether the register dependence src -> dst is loop carried
+//
+// In SSA, only phi's can have a loop carried dependence, and then
+// only if src is the operand for the back edge
+static bool isLoopCarriedRegister(Use& use, Instruction* dst,
+                                  BasicBlock* backEdge) {
+  PHINode* phi = dyn_cast<PHINode>(dst);
+  if (!phi) return false;
+
+  return phi->getIncomingBlock(use) == backEdge;
+}
+
 static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
   PDG graph;
+
+  BasicBlock* incoming;
+  BasicBlock* backedge;
+  assert(loop->getIncomingAndBackEdge(incoming, backedge)
+    && "Loop does not have unique incoming or back edge");
 
   std::map<Instruction*, int> nodes;
   std::set<Instruction*> memInsts; // The instructions which touch memory
 
   for (BasicBlock* bb : loop->blocks()) {
-    for (Instruction& i : *bb) {
-      nodes[&i] = graph.insertNode(PDGNode(&i));
+    for (Instruction& inst : *bb) {
+      int node = graph.insertNode(PDGNode(&inst));
+      nodes[&inst] = node;
 
       // Process data dependencies here
       // Only consider memory dependencies for instructions which touch memory
-      if (i.mayReadOrWriteMemory()) {
-        memInsts.insert(&i);
+      if (inst.mayReadOrWriteMemory()) {
+        memInsts.insert(&inst);
         for (Instruction* other : memInsts) {
           // TODO: Is there a data dependence between these instructions?
         }
@@ -130,11 +150,38 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
       // Handle register dependencies for all instructions, this is simply
       // using use-def chains in LLVM (the uses of this instruciton and the
       // values used by it)
-      // TODO
+      for (Use& op : inst.operands()) {
+        Instruction* opInst = dyn_cast<Instruction>(op.get());
+        if (opInst) {
+          auto f = nodes.find(opInst);
+          if (f != nodes.end()) {
+            bool carried = isLoopCarriedRegister(op, &inst, backedge);
+            // Direction, register value written in op used in inst
+            graph.addEdge(f->second, node, PDGEdge(PDGEdge::Register, carried));
+            LLVM_DEBUG(
+              errs() << "Dependence from " << *opInst << " to " << inst 
+                     << (carried ? " (loop carried)\n" : "\n")); 
+          }
+        }
+      }
+      for (Use& use : inst.uses()) {
+        Instruction* useInst = dyn_cast<Instruction>(use.getUser());
+        if (useInst) {
+          auto f = nodes.find(useInst);
+          if (f != nodes.end()) {
+            bool carried = isLoopCarriedRegister(use, useInst, backedge);
+            // Direction, register value written in inst used in use
+            graph.addEdge(node, f->second, PDGEdge(PDGEdge::Register, carried));
+            LLVM_DEBUG(
+              errs() << "Dependence from " << inst << " to " << *useInst
+                     << (carried ? " (loop carried)\n" : "\n")); 
+          }
+        }
+      }
     }
   }
 
-  // Handle control flow dependencies here
+  // Handle control flow dependencies here (TODO)
 
   return DiGraph<PDGNode, PDGEdge>();
 }
