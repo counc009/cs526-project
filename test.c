@@ -6,6 +6,8 @@ struct node {
   struct node* restrict next;
 };
 
+typedef struct node* restrict list_t;
+
 struct node* generateList(unsigned seed) {
   srand(seed);
   
@@ -26,15 +28,15 @@ struct node* generateList(unsigned seed) {
   return list;
 }
 
-void printList(struct node* list) {
-  struct node* ptr = list;
+void printList(list_t list) {
+  list_t ptr = list;
   while ((ptr = ptr->next)) {
     printf("%d\n", ptr->val);
   }
 }
 
-void incList(struct node* restrict list) {
-  struct node* restrict ptr = list;
+void incList(list_t list) {
+  list_t ptr = list;
   while ((ptr = ptr->next)) {
     ptr->val = ptr->val + 1;
   }
@@ -42,7 +44,8 @@ void incList(struct node* restrict list) {
 
 void incArray(int* arr, int n) {
   for (int i = 0; i < n; i++)
-    arr[i] += 1;
+    if (arr[i] % 2 == 0)
+      arr[i] += 1;
 }
 
 int main(int argc, char** argv) {

@@ -1,12 +1,14 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
+#include "llvm/Analysis/DominanceFrontier.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Pass.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/GraphWriter.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils.h"
 
 #include <map>
@@ -84,12 +86,100 @@ namespace {
       else return nullptr;
     }
   };
+
+  class WorkObject {
+  public:
+    using DomTreeNode = DomTreeNodeBase<BasicBlock>;
+
+    WorkObject(BasicBlock* B, BasicBlock* P, const DomTreeNode* N,
+               const DomTreeNode* PN)
+        : currentBB(B), parentBB(P), Node(N), parentNode(PN) {}
+
+    BasicBlock* currentBB;
+    BasicBlock* parentBB;
+    const DomTreeNode* Node;
+    const DomTreeNode* parentNode;
+  };
+
+  iterator_range<const_pred_iterator> preds(const BasicBlock* BB) {
+    return make_range(pred_begin(BB), pred_end(BB));
+  }
+
+  // The code for this is based on Cytron et al. and LLVM's construction of
+  // Forward Dominance Frontiers
+  class ReverseDominanceFrontier {
+  private:
+    std::map<BasicBlock*, std::set<const BasicBlock*>> RDF;
+  public:
+    std::set<const BasicBlock*> rdf(BasicBlock* bb) { return RDF[bb]; }
+
+    ReverseDominanceFrontier(Function& F) {
+      PostDominatorTree PDT(F); // Note: PDT.dominates(A, B) <=> A postdom B
+      DomTreeNodeBase<BasicBlock>* Node = PDT[PDT.getRoot()];
+      BasicBlock* BB = Node->getBlock();
+
+      std::vector<WorkObject> worklist;
+      std::set<BasicBlock*> visited;
+      
+      worklist.push_back(WorkObject(BB, nullptr, Node, nullptr));
+      do {
+        WorkObject* currentW = &worklist.back();
+        
+        BasicBlock* currentBB = currentW->currentBB;
+        BasicBlock* parentBB  = currentW->parentBB;
+
+        const DomTreeNodeBase<BasicBlock>* currentNode = currentW->Node;
+        const DomTreeNodeBase<BasicBlock>* parentNode  = currentW->parentNode;
+
+        assert(currentBB && "Invalid work object. Missing current Basic Block");
+        assert(currentNode && "Invalid work object. Missing current Node");
+
+        std::set<const BasicBlock*>& S = RDF[currentBB];
+
+        // Visit each block only once. (DFlocal part)
+        if (visited.insert(currentBB).second) {
+          // Loop over CFG successors to calculate DFlocal[currentNode]
+          for (const auto Pred : preds(currentBB)) {
+            if (PDT[Pred]->getIDom() != currentNode)
+              S.insert(Pred);
+          }
+        }
+
+        // At this point, S is DFlocal. Now we union in DFup's of our children
+        bool visitChild = false;
+        for (auto NI = currentNode->begin(), NE = currentNode->end();
+             NI != NE; ++NI) {
+          DomTreeNodeBase<BasicBlock>* IDominee = *NI;
+          BasicBlock* childBB = IDominee->getBlock();
+          if (visited.count(childBB) == 0) {
+            worklist.push_back(WorkObject(childBB, currentBB, IDominee, currentNode));
+            visitChild = true;
+          }
+        }
+
+        // If all children are visited or there is any child then pop this block
+        // from the worklist.
+        if (!visitChild) {
+          if (!parentBB) break;
+
+          auto CDFI = S.begin(), CDFE = S.end();
+          auto& parentSet = RDF[parentBB];
+          for (; CDFI != CDFE; ++CDFI) {
+            if (!PDT.properlyDominates(parentNode, PDT[*CDFI]))
+              parentSet.insert(*CDFI);
+          }
+          worklist.pop_back();
+        }
+      } while (!worklist.empty());
+    }
+  };
 }
 
 using PDG = DiGraph<PDGNode, PDGEdge>;
 using DAG = DiGraph<DAGNode, DAGEdge>;
 
-static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&);
+static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
+                       ReverseDominanceFrontier&);
 static DAG computeDAGscc(PDG);
 
 bool PS_DSWP::runOnFunction(Function &F) {
@@ -101,11 +191,13 @@ bool PS_DSWP::runOnFunction(Function &F) {
   LoopInfo LI(DT);
   DependenceInfo& DI = getAnalysis<DependenceAnalysisWrapperPass>().getDI();
 
+  ReverseDominanceFrontier RDF(F);
+
   // For now, just considering the top level loops. Not actually sure if this
   // is correct behavior in general
   for (Loop* loop : LI.getTopLevelLoops()) {
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
-    PDG pdg = generatePDG(loop, LI, DI, DT);
+    PDG pdg = generatePDG(loop, LI, DI, DT, RDF);
     DAG dag_scc = computeDAGscc(pdg);
     // TODO: partition, code-gen, etc.
   }
@@ -195,7 +287,7 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
 }
 
 static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
-                       DominatorTree& DT) {
+                       DominatorTree& DT, ReverseDominanceFrontier& RDF) {
   PDG graph;
 
   BasicBlock* incoming;
@@ -263,9 +355,34 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
     }
   }
 
-  // Handle control flow dependencies here (TODO)
+  // Compute control dependenceis and add them to the graph
+  // Use Reverse Dominance Frontier to get the control dependences
+  // (specifically if X in RDF(Y) then Y is control dependent on X
+  for (BasicBlock* bb : loop->blocks()) {
+    for (const BasicBlock* b : RDF.rdf(bb)) {
+      // This means that bb has a control dependence on b
+      //
+      // Specifically, therefore, each instruction in bb has a dependence on
+      // the terminator of b
+      Instruction* terminator = (Instruction*) b->getTerminator();
+      auto f = nodes.find(terminator);
+      if (f != nodes.end()) {
+        // Doesn't actually matter what instruction we use in bb
+        bool loopCarried = liesBetween(terminator, bb->getTerminator(),
+                                       backedge->getTerminator(), &DT);
+        for (Instruction& inst : *bb) {
+          graph.addEdge(f->second, nodes[&inst],
+                        PDGEdge(PDGEdge::Control, loopCarried));
+          LLVM_DEBUG(
+            dbgs() << "[psdswp] Control dependence from " << *terminator
+                   << " to " << inst
+                   << (loopCarried ? " (loop carried)\n" : "\n"));
+        }
+      }
+    }
+  }
 
-  return DiGraph<PDGNode, PDGEdge>();
+  return graph;
 }
 
 static DAG computeDAGscc(PDG pdg) {
