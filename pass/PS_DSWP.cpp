@@ -1,3 +1,5 @@
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Dominators.h"
@@ -87,11 +89,11 @@ namespace {
 using PDG = DiGraph<PDGNode, PDGEdge>;
 using DAG = DiGraph<DAGNode, DAGEdge>;
 
-static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&);
+static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&);
 static DAG computeDAGscc(PDG);
 
 bool PS_DSWP::runOnFunction(Function &F) {
-  LLVM_DEBUG(errs() << "Running PS-DSWP on function " << F.getName() << "!\n");
+  LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
   
   bool modified = false; // Tracks whether we modified the function
 
@@ -102,10 +104,10 @@ bool PS_DSWP::runOnFunction(Function &F) {
   // For now, just considering the top level loops. Not actually sure if this
   // is correct behavior in general
   for (Loop* loop : LI.getTopLevelLoops()) {
-    LLVM_DEBUG(errs() << "\tRunning on loop " << *loop << "\n");
-    PDG pdg = generatePDG(loop, LI, DI);
+    LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
+    PDG pdg = generatePDG(loop, LI, DI, DT);
     DAG dag_scc = computeDAGscc(pdg);
-    // TODO
+    // TODO: partition, code-gen, etc.
   }
 
   return modified;
@@ -123,7 +125,77 @@ static bool isLoopCarriedRegister(Use& use, Instruction* dst,
   return phi->getIncomingBlock(use) == backEdge;
 }
 
-static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
+// Taken from GVN.cpp (in LLVM source) since it's declared as static there.
+// This tests whether Between lies on every path from From to To
+// Note that this method relies on To being reachable from both From and
+// Between, which in our use we know is true since both From and To are in the
+// loop and Between is branch which creates the back edge
+static bool liesBetween(const Instruction *From, Instruction *Between,
+                        const Instruction *To, DominatorTree *DT) {
+  if (From->getParent() == Between->getParent())
+    return DT->dominates(From, Between);
+  SmallSet<BasicBlock*, 1> Exclusion;
+  Exclusion.insert(Between->getParent());
+  return !isPotentiallyReachable(From, To, &Exclusion, DT);
+}
+
+static void checkMemoryDependence(Instruction& src, Instruction& dst,
+                                  int srcNode, int dstNode,
+                                  PDG& graph, BasicBlock* backedge,
+                                  DominatorTree& DT, DependenceInfo& DI) {
+  // First, see if we can reach dst from src without traversing the back edge
+  // LLVM supports checking reachability without traversing a set of basic
+  // blocks, so we check reachability without entering the basic block that
+  // contains the back edge and then handle either of the instructions being
+  // in that basic block
+  bool maybeLoopIndependent = false;
+  if (src.getParent() == backedge && dst.getParent() == backedge) {
+    // If both instructions are in the back edge's basic block, test whether
+    // src is before dst
+    maybeLoopIndependent = src.comesBefore(&dst);
+  } else if (src.getParent() == backedge) {
+    // If src is in the back edge basic block and dst isn't, it must be loop
+    // carried
+  } else if (dst.getParent() == backedge) {
+    // If dst is in the back edge basic block and src isn't, it may be loop
+    // independent
+    maybeLoopIndependent = true;
+  } else {
+    // May be loop independent if the back edge's terminator does not exist
+    // on every path from src to dst
+    maybeLoopIndependent = !liesBetween(&src, &dst, backedge->getTerminator(),
+                                        &DT);
+  }
+  
+  std::unique_ptr<Dependence> dependence = 
+    DI.depends(&src, &dst, maybeLoopIndependent);
+  if (dependence != nullptr) {
+    unsigned direction = dependence->getDirection(1);
+    LLVM_DEBUG(
+      std::string dirStr = "UNKNOWN";
+      switch (direction) {
+        case Dependence::DVEntry::NONE: dirStr = "NONE"; break;
+        case Dependence::DVEntry::LT:   dirStr = "LT"; break;
+        case Dependence::DVEntry::EQ:   dirStr = "EQ"; break;
+        case Dependence::DVEntry::LE:   dirStr = "LE"; break;
+        case Dependence::DVEntry::GT:   dirStr = "GT"; break;
+        case Dependence::DVEntry::NE:   dirStr = "NE"; break;
+        case Dependence::DVEntry::GE:   dirStr = "GE"; break;
+        case Dependence::DVEntry::ALL:  dirStr = "ALL"; break;
+      }
+      dbgs() << "[psdswp] Memory dependence from " << src << " to  " << dst
+             << (!dependence->isLoopIndependent() ? " (loop carried)" : "")
+             << " direction " << dirStr << "\n");
+    if (direction != Dependence::DVEntry::LT) {
+      // Only include dependence that aren't negative
+      graph.addEdge(srcNode, dstNode, PDGEdge{PDGEdge::Memory,
+                                        !dependence->isLoopIndependent()});
+    }
+  }
+}
+
+static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
+                       DominatorTree& DT) {
   PDG graph;
 
   BasicBlock* incoming;
@@ -132,6 +204,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
     && "Loop does not have unique incoming or back edge");
 
   std::map<Instruction*, int> nodes;
+  
   std::set<Instruction*> memInsts; // The instructions which touch memory
 
   for (BasicBlock* bb : loop->blocks()) {
@@ -142,10 +215,19 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
       // Process data dependencies here
       // Only consider memory dependencies for instructions which touch memory
       if (inst.mayReadOrWriteMemory()) {
-        memInsts.insert(&inst);
         for (Instruction* other : memInsts) {
-          // TODO: Is there a data dependence between these instructions?
+          if (inst.mayWriteToMemory() || other->mayWriteToMemory()) {
+            // Only need to consider dependence if at least one instruction
+            // writes memory
+            int thisNode = nodes[&inst];
+            int otherNode = nodes[other];
+            checkMemoryDependence(inst, *other, thisNode, otherNode, graph,
+                                  backedge, DT, DI);
+            checkMemoryDependence(*other, inst, otherNode, thisNode, graph,
+                                  backedge, DT, DI);
+          }
         }
+        memInsts.insert(&inst);
       }
       // Handle register dependencies for all instructions, this is simply
       // using use-def chains in LLVM (the uses of this instruciton and the
@@ -159,8 +241,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
             // Direction, register value written in op used in inst
             graph.addEdge(f->second, node, PDGEdge(PDGEdge::Register, carried));
             LLVM_DEBUG(
-              errs() << "Dependence from " << *opInst << " to " << inst 
-                     << (carried ? " (loop carried)\n" : "\n")); 
+              dbgs() << "[psdswp] Register dependence from " << *opInst
+                     << " to " << inst << (carried?" (loop carried)\n":"\n")); 
           }
         }
       }
@@ -173,8 +255,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI) {
             // Direction, register value written in inst used in use
             graph.addEdge(node, f->second, PDGEdge(PDGEdge::Register, carried));
             LLVM_DEBUG(
-              errs() << "Dependence from " << inst << " to " << *useInst
-                     << (carried ? " (loop carried)\n" : "\n")); 
+              dbgs() << "[psdswp] Register dependence from " << inst << " to "
+                     << *useInst << (carried ? " (loop carried)\n" : "\n")); 
           }
         }
       }

@@ -3,7 +3,7 @@
 
 struct node {
   int val;
-  struct node* next;
+  struct node* restrict next;
 };
 
 struct node* generateList(unsigned seed) {
@@ -33,11 +33,16 @@ void printList(struct node* list) {
   }
 }
 
-void incList(struct node* list) {
-  struct node* ptr = list;
+void incList(struct node* restrict list) {
+  struct node* restrict ptr = list;
   while ((ptr = ptr->next)) {
     ptr->val = ptr->val + 1;
   }
+}
+
+void incArray(int* arr, int n) {
+  for (int i = 0; i < n; i++)
+    arr[i] += 1;
 }
 
 int main(int argc, char** argv) {
