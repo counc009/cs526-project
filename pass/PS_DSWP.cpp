@@ -307,6 +307,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
       // Process data dependencies here
       // Only consider memory dependencies for instructions which touch memory
       if (inst.mayReadOrWriteMemory()) {
+        memInsts.insert(&inst); // Insert first so we'll consider self loops
         for (Instruction* other : memInsts) {
           if (inst.mayWriteToMemory() || other->mayWriteToMemory()) {
             // Only need to consider dependence if at least one instruction
@@ -315,11 +316,12 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             int otherNode = nodes[other];
             checkMemoryDependence(inst, *other, thisNode, otherNode, graph,
                                   backedge, DT, DI);
-            checkMemoryDependence(*other, inst, otherNode, thisNode, graph,
-                                  backedge, DT, DI);
+            if (thisNode != otherNode) {
+              checkMemoryDependence(*other, inst, otherNode, thisNode, graph,
+                                    backedge, DT, DI);
+            }
           }
         }
-        memInsts.insert(&inst);
       }
       // Handle register dependencies for all instructions, this is simply
       // using use-def chains in LLVM (the uses of this instruciton and the
