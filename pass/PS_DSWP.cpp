@@ -67,6 +67,8 @@ namespace {
     }
 
     TNode& getNode(int n) { return nodes[n]; }
+    
+    int getNodeCount() { return nodes.size(); }
 
     void addEdge(int src, int dst, TEdge edge) {
       std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
@@ -78,7 +80,18 @@ namespace {
         nodeEdges[dst] = std::vector<TEdge>({edge});
       }
     }
-    
+
+    //Function to get all adjacent nodes to a particular node
+    std::vector<int> getAdjs(int src) {
+      auto nodeEdges = edges[src];
+      std::vector<int> adj;
+      for (auto const& i : nodeEdges){
+	    //std::cout << i.first << ':'<< i.second << std::endl;
+	    adj.push_back(i.first);    
+	    }
+      return adj;
+    }
+
     TEdge* getEdge(int src, int dst) {
       std::map<int, TEdge>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
@@ -387,11 +400,19 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
   return graph;
 }
 
-static DAG computeDAGscc(PDG pdg) {
-  // TODO
+static DAG computeDAGscc(PDG graph) {
+  //Unit testing new functions
+  LLVM_DEBUG(dbgs() << "Number of nodes in the graph " << graph.getNodeCount() << "\n");
+  for(int i=0;i<graph.getNodeCount();i++){
+    std::vector<int> adjacents = graph.getAdjs(i);
+    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+  for(size_t j=0;j<adjacents.size();j++)
+    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+   LLVM_DEBUG(dbgs() <<"\n");
+  }
+  //TODO Integrate working Tarjans Code with This Digraph implementation using newly added functions
   return DiGraph<DAGNode, DAGEdge>();
 }
-
 char PS_DSWP::ID = 0;
 
 static RegisterPass<PS_DSWP> X("psdswp",
