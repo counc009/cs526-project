@@ -80,8 +80,7 @@ namespace {
         nodeEdges[dst] = std::vector<TEdge>({edge});
       }
     }
-
-    //Function to get all adjacent nodes to a particular node
+    
     std::vector<int> getAdjs(int src) {
       auto nodeEdges = edges[src];
       std::vector<int> adj;
@@ -89,9 +88,9 @@ namespace {
 	    //std::cout << i.first << ':'<< i.second << std::endl;
 	    adj.push_back(i.first);    
 	    }
-      return adj;
+        return adj;
     }
-
+    
     TEdge* getEdge(int src, int dst) {
       std::map<int, TEdge>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
@@ -194,6 +193,7 @@ using DAG = DiGraph<DAGNode, DAGEdge>;
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
                        ReverseDominanceFrontier&);
 static DAG computeDAGscc(PDG);
+static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -211,6 +211,7 @@ bool PS_DSWP::runOnFunction(Function &F) {
   for (Loop* loop : LI.getTopLevelLoops()) {
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
     PDG pdg = generatePDG(loop, LI, DI, DT, RDF);
+    LLVM_DEBUG(dbgs() << "Performing SCCC Tests " << "\n");
     DAG dag_scc = computeDAGscc(pdg);
     // TODO: partition, code-gen, etc.
   }
@@ -400,6 +401,63 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
   return graph;
 }
 
+static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
+					bool stackMember[], PDG graph)
+{
+
+	static int time = 0;
+
+	// Initialize discovery time and low value
+	disc[u] = low[u] = ++time;
+	st->push(u);
+	stackMember[u] = true;
+
+	// Go through all vertices adjacent to this
+	std::vector<int> adjacents  = graph.getAdjs(u);
+	/*
+	LLVM_DEBUG(dbgs() << "Adjacent nodes of " << u << ":");
+	for(size_t j=0;j<adjacents.size();j++)
+        LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+   LLVM_DEBUG(dbgs() <<"\n");
+   */
+	for(size_t j=0;j<adjacents.size();j++)
+	{   
+		int v = adjacents[j]; // v is current adjacent of 'u'
+
+		// If v is not visited yet, then recur for it
+		if (disc[v] == -1)
+		{
+			strongconnect(v, disc, low, st, stackMember, graph);
+
+			// Check if the subtree rooted with 'v' has a
+			// connection to one of the ancestors of 'u'
+			low[u] = std::min(low[u], low[v]);
+		}
+
+		// Update low value of 'u' if 'v' is still in stack
+		else if (stackMember[v] == true)
+			low[u] = std::min(low[u], disc[v]);
+	}
+	// head node found, pop the stack and print an SCC
+	int w = 0; // To store stack extracted vertices
+	if (low[u] == disc[u])
+	{
+		while (st->top() != u)
+		{
+			w = (int) st->top();
+			//cout << w << " ";
+			LLVM_DEBUG(dbgs() << w << " ");
+			stackMember[w] = false;
+			st->pop();
+		}
+		w = (int) st->top();
+		//cout << w << "\n";
+		LLVM_DEBUG(dbgs() << w << "\n");
+		stackMember[w] = false;
+		st->pop();
+	}
+}
+
 static DAG computeDAGscc(PDG graph) {
   //Unit testing new functions
   LLVM_DEBUG(dbgs() << "Number of nodes in the graph " << graph.getNodeCount() << "\n");
@@ -410,9 +468,29 @@ static DAG computeDAGscc(PDG graph) {
     LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
    LLVM_DEBUG(dbgs() <<"\n");
   }
-  //TODO Integrate working Tarjans Code with This Digraph implementation using newly added functions
+  
+	int V = graph.getNodeCount();
+    int *disc = new int[V];
+	int *low = new int[V];
+	bool *stackMember = new bool[V];
+	std::stack<int> *st = new std::stack<int>();
+
+	// Initialize disc and low, and stackMember arrays
+	for (int i = 0; i < V; i++)
+	{
+		disc[i] = -1;
+		low[i] = -1;
+		stackMember[i] = false;
+	}
+
+	// Call the recursive helper function to find strongly
+	// connected components in DFS tree with vertex 'i'
+	for (int i = 0; i < V; i++)
+		if (disc[i] == -1)
+			strongconnect(i, disc, low, st, stackMember, graph);
   return DiGraph<DAGNode, DAGEdge>();
 }
+
 char PS_DSWP::ID = 0;
 
 static RegisterPass<PS_DSWP> X("psdswp",
