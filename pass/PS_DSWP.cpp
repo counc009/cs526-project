@@ -91,6 +91,15 @@ namespace {
         return adj;
     }
     
+    bool hasEdge(int src, int dst) {
+      auto nodeEdges = edges[src];
+      auto f = nodeEdges.find(dst);
+      if (f != nodeEdges.end()) 
+      	return &(*f);
+      else 
+      	return nullptr;
+    }
+    
     TEdge* getEdge(int src, int dst) {
       std::map<int, TEdge>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
@@ -193,7 +202,7 @@ using DAG = DiGraph<DAGNode, DAGEdge>;
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
                        ReverseDominanceFrontier&);
 static DAG computeDAGscc(PDG);
-static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG);
+static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -402,7 +411,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
 }
 
 static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
-					bool stackMember[], PDG graph)
+					bool stackMember[], PDG graph, DAG &dag_scc, std::map<int, std::vector<int>> &pdg_to_scc)
 {
 
 	static int time = 0;
@@ -427,7 +436,7 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 		// If v is not visited yet, then recur for it
 		if (disc[v] == -1)
 		{
-			strongconnect(v, disc, low, st, stackMember, graph);
+			strongconnect(v, disc, low, st, stackMember, graph, dag_scc, pdg_to_scc);
 
 			// Check if the subtree rooted with 'v' has a
 			// connection to one of the ancestors of 'u'
@@ -441,20 +450,51 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 	// head node found, pop the stack and print an SCC
 	int w = 0; // To store stack extracted vertices
 	if (low[u] == disc[u])
-	{
+	{	//int node = graph.insertNode(PDGNode(&inst));
+		std::vector<Instruction*> insts;
+		std::vector<int> node_maps;
+		bool loopcarried = false;
+		int len = dag_scc.getNodeCount();
+		Instruction* w_inst;
 		while (st->top() != u)
 		{
 			w = (int) st->top();
 			//cout << w << " ";
 			LLVM_DEBUG(dbgs() << w << " ");
+			w_inst = graph.getNode(w).inst;
+			insts.push_back(w_inst);
+			node_maps.push_back(w);
 			stackMember[w] = false;
 			st->pop();
 		}
 		w = (int) st->top();
 		//cout << w << "\n";
 		LLVM_DEBUG(dbgs() << w << "\n");
+		w_inst = graph.getNode(w).inst;
+		insts.push_back(w_inst);
+		node_maps.push_back(w);
 		stackMember[w] = false;
 		st->pop();
+		DAGNode combined;
+		combined.insts = insts;
+		pdg_to_scc.insert({len, node_maps});
+		/*
+		for(size_t i1 = 0; i1< node_maps.size();i1++)
+			for(size_t i2 = 0; i2< node_maps.size();i2++)
+				{
+				PDGEdge* edge = graph.getEdge(i1,i2);
+				if(edge==nullptr)
+					continue;
+				else
+					if(edge->loopCarried==true)
+						loopcarried = true;	
+				}
+		if(loopcarried == false)
+			combined.doall = true;
+		else
+			combined.doall = false;
+			*/
+		int n = dag_scc.insertNode(combined);
 	}
 }
 
@@ -469,6 +509,9 @@ static DAG computeDAGscc(PDG graph) {
    LLVM_DEBUG(dbgs() <<"\n");
   }
   
+  	DAG dag_scc;
+  	std::map<int, std::vector<int>> pdg_to_scc;
+  
 	int V = graph.getNodeCount();
     int *disc = new int[V];
 	int *low = new int[V];
@@ -482,14 +525,33 @@ static DAG computeDAGscc(PDG graph) {
 		low[i] = -1;
 		stackMember[i] = false;
 	}
-
+	
 	// Call the recursive helper function to find strongly
 	// connected components in DFS tree with vertex 'i'
 	for (int i = 0; i < V; i++)
 		if (disc[i] == -1)
-			strongconnect(i, disc, low, st, stackMember, graph);
+			strongconnect(i, disc, low, st, stackMember, graph, dag_scc, pdg_to_scc);
+	
+  LLVM_DEBUG(dbgs() << "Number of nodes in the graph " << dag_scc.getNodeCount() << "\n");
+  for(int i=0;i<dag_scc.getNodeCount();i++){
+    std::vector<int> adjacents = dag_scc.getAdjs(i);
+    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+  for(size_t j=0;j<adjacents.size();j++)
+    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+   LLVM_DEBUG(dbgs() <<"\n");
+  }
+  
+  for (auto const& i : pdg_to_scc){
+	    LLVM_DEBUG(dbgs() << i.first << ':');
+	    for(size_t x=0;x<i.second.size();x++)
+	    	LLVM_DEBUG(dbgs() << i.second[x] << " ");
+	    LLVM_DEBUG(dbgs() <<"\n");
+	    	
+	}
+
   return DiGraph<DAGNode, DAGEdge>();
 }
+
 
 char PS_DSWP::ID = 0;
 
