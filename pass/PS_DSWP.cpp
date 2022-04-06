@@ -81,6 +81,18 @@ namespace {
       }
     }
     
+    bool hasLoopCarriedEdge(int src, int dst) {
+      std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
+      auto f = nodeEdges.find(dst);
+      if (f != nodeEdges.end()) {
+        auto edge_list = nodeEdges[dst];
+        for(size_t i = 0;i<edge_list.size();i++)
+        	if(edge_list[i].loopCarried == true)
+        		return true;
+      } 
+        return false;
+    }
+    
     std::vector<int> getAdjs(int src) {
       auto nodeEdges = edges[src];
       std::vector<int> adj;
@@ -95,16 +107,18 @@ namespace {
       auto nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
       if (f != nodeEdges.end()) 
-      	return &(*f);
+      	return true;
       else 
-      	return nullptr;
+      	return false;
     }
     
-    TEdge* getEdge(int src, int dst) {
-      std::map<int, TEdge>& nodeEdges = edges[src];
+    std::vector<TEdge> getEdge(int src, int dst) {
+      std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
-      if (f != nodeEdges.end()) return &(*f);
-      else return nullptr;
+      if (f != nodeEdges.end()) 
+      	return nodeEdges[dst];
+      else 
+      	return {};
     }
   };
 
@@ -202,7 +216,8 @@ using DAG = DiGraph<DAGNode, DAGEdge>;
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
                        ReverseDominanceFrontier&);
 static DAG computeDAGscc(PDG);
-static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&);
+static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&, std::map<int, int>&);
+static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -410,10 +425,37 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
   return graph;
 }
 
-static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
-					bool stackMember[], PDG graph, DAG &dag_scc, std::map<int, std::vector<int>> &pdg_to_scc)
-{
 
+static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> &scc_to_pdg_map, std::map<int, int> &pdg_to_scc_map){
+
+	for(size_t i = 0;i<pdg_to_scc_map.size(); i++)
+		for(size_t j = 0; j < pdg_to_scc_map.size(); j++){
+			if(pdg_to_scc_map[i] == pdg_to_scc_map[j])
+				continue;
+			else{
+				std::vector<PDGEdge> edges = graph.getEdge(i , j);
+				for (size_t k = 0; k < edges.size(); k++)
+					dag_scc.addEdge( pdg_to_scc_map[i] , pdg_to_scc_map[j] , edges[k] );		
+			}	
+	}
+
+  LLVM_DEBUG(dbgs() << " [psdswp] Number of nodes in DAG SCC the graph " << dag_scc.getNodeCount() << "\n");
+  for(int i=0;i<dag_scc.getNodeCount();i++){
+    std::vector<int> adjacents = dag_scc.getAdjs(i);
+    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+  for(size_t j=0;j<adjacents.size();j++)
+    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+   LLVM_DEBUG(dbgs() <<"\n");
+  }
+  
+	return dag_scc;
+}
+
+
+static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
+					bool stackMember[], PDG graph, DAG &dag_scc, std::map<int, std::vector<int>> &scc_to_pdg_map, std::map<int, int> &pdg_to_scc_map)
+{
+	
 	static int time = 0;
 
 	// Initialize discovery time and low value
@@ -436,7 +478,7 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 		// If v is not visited yet, then recur for it
 		if (disc[v] == -1)
 		{
-			strongconnect(v, disc, low, st, stackMember, graph, dag_scc, pdg_to_scc);
+			strongconnect(v, disc, low, st, stackMember, graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 
 			// Check if the subtree rooted with 'v' has a
 			// connection to one of the ancestors of 'u'
@@ -464,6 +506,7 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 			w_inst = graph.getNode(w).inst;
 			insts.push_back(w_inst);
 			node_maps.push_back(w);
+			pdg_to_scc_map.insert({w, len});
 			stackMember[w] = false;
 			st->pop();
 		}
@@ -474,43 +517,42 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 		insts.push_back(w_inst);
 		node_maps.push_back(w);
 		stackMember[w] = false;
+		pdg_to_scc_map.insert({w, len});
 		st->pop();
 		DAGNode combined;
 		combined.insts = insts;
-		pdg_to_scc.insert({len, node_maps});
-		/*
+		scc_to_pdg_map.insert({len, node_maps});
+		pdg_to_scc_map.insert({w, len});
+				
+		
 		for(size_t i1 = 0; i1< node_maps.size();i1++)
 			for(size_t i2 = 0; i2< node_maps.size();i2++)
-				{
-				PDGEdge* edge = graph.getEdge(i1,i2);
-				if(edge==nullptr)
-					continue;
-				else
-					if(edge->loopCarried==true)
-						loopcarried = true;	
-				}
+				loopcarried = loopcarried || graph.hasLoopCarriedEdge(i1,i2);
+				//LLVM_DEBUG(dbgs() << loopcarried << "," << graph.hasLoopCarriedEdge(i1,i2) << ",");
+
 		if(loopcarried == false)
 			combined.doall = true;
 		else
 			combined.doall = false;
-			*/
+			
 		int n = dag_scc.insertNode(combined);
 	}
 }
 
 static DAG computeDAGscc(PDG graph) {
   //Unit testing new functions
-  LLVM_DEBUG(dbgs() << "Number of nodes in the graph " << graph.getNodeCount() << "\n");
+  LLVM_DEBUG(dbgs() << "[psdswp] Number of nodes in PDG the graph " << graph.getNodeCount() << "\n");
   for(int i=0;i<graph.getNodeCount();i++){
     std::vector<int> adjacents = graph.getAdjs(i);
-    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+    LLVM_DEBUG(dbgs() << "[psdswp] Adjacent nodes of " << i << ":");
   for(size_t j=0;j<adjacents.size();j++)
     LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
    LLVM_DEBUG(dbgs() <<"\n");
   }
   
   	DAG dag_scc;
-  	std::map<int, std::vector<int>> pdg_to_scc;
+  	std::map<int, std::vector<int>> scc_to_pdg_map; //map nodes of sccc to constituent pdg nodes
+  	std::map<int, int> pdg_to_scc_map;  //map nodes of pdg to combind dag node
   
 	int V = graph.getNodeCount();
     int *disc = new int[V];
@@ -528,28 +570,24 @@ static DAG computeDAGscc(PDG graph) {
 	
 	// Call the recursive helper function to find strongly
 	// connected components in DFS tree with vertex 'i'
+	LLVM_DEBUG(dbgs() << "[psdswp] Strongly Connected Components");
 	for (int i = 0; i < V; i++)
 		if (disc[i] == -1)
-			strongconnect(i, disc, low, st, stackMember, graph, dag_scc, pdg_to_scc);
+			strongconnect(i, disc, low, st, stackMember, graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
+			
 	
-  LLVM_DEBUG(dbgs() << "Number of nodes in the graph " << dag_scc.getNodeCount() << "\n");
+	
+  LLVM_DEBUG(dbgs() << "[psdswp] Number of nodes in the graph " << dag_scc.getNodeCount() << "\n");
   for(int i=0;i<dag_scc.getNodeCount();i++){
     std::vector<int> adjacents = dag_scc.getAdjs(i);
-    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+    LLVM_DEBUG(dbgs() << "[psdswp] Adjacent nodes of " << i << ":");
   for(size_t j=0;j<adjacents.size();j++)
     LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
    LLVM_DEBUG(dbgs() <<"\n");
   }
   
-  for (auto const& i : pdg_to_scc){
-	    LLVM_DEBUG(dbgs() << i.first << ':');
-	    for(size_t x=0;x<i.second.size();x++)
-	    	LLVM_DEBUG(dbgs() << i.second[x] << " ");
-	    LLVM_DEBUG(dbgs() <<"\n");
-	    	
-	}
+  return connectEdges( graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 
-  return DiGraph<DAGNode, DAGEdge>();
 }
 
 
