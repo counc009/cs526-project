@@ -7,11 +7,13 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GraphWriter.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils.h"
 
 #include <map>
+#include <queue>
 #include <vector>
 
 #define DEBUG_TYPE "psdswp"
@@ -19,6 +21,10 @@
 using namespace llvm;
 
 namespace {
+  cl::opt<unsigned int> numThreads("num-threads",
+    cl::desc("Number of threads for PS-DSWP parallelization"),
+    cl::value_desc("threads"));
+
   struct PS_DSWP : public FunctionPass {
     static char ID; // Pass identification
     PS_DSWP() : FunctionPass(ID) {}
@@ -218,10 +224,16 @@ static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
 static DAG computeDAGscc(PDG);
 static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&, std::map<int, int>&);
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
+static DAG threadPartitioning(DAG dag);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
-  
+  if (numThreads < 2) {
+    errs() << "PS-DSWP pass skipped since it was does not run with less than "
+              "two threads\n";
+    return false;
+  }
+
   bool modified = false; // Tracks whether we modified the function
 
   DominatorTree DT(F);
@@ -235,9 +247,15 @@ bool PS_DSWP::runOnFunction(Function &F) {
   for (Loop* loop : LI.getTopLevelLoops()) {
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
     PDG pdg = generatePDG(loop, LI, DI, DT, RDF);
+
     LLVM_DEBUG(dbgs() << "Performing SCCC Tests " << "\n");
     DAG dag_scc = computeDAGscc(pdg);
-    // TODO: partition, code-gen, etc.
+    if (dag_scc.getNodeCount() <= 1 && !dag_scc.getNode(0).doall) continue;
+
+    LLVM_DEBUG(dbgs() << "[psdswp] Partitioning graph\n");
+    DAG partitioned = threadPartitioning(dag_scc);
+    
+    // TODO: code-gen, etc.
   }
 
   return modified;
@@ -279,7 +297,9 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
   // contains the back edge and then handle either of the instructions being
   // in that basic block
   bool maybeLoopIndependent = false;
-  if (src.getParent() == backedge && dst.getParent() == backedge) {
+  if (&src == &dst) {
+    maybeLoopIndependent = true;
+  } else if (src.getParent() == backedge && dst.getParent() == backedge) {
     // If both instructions are in the back edge's basic block, test whether
     // src is before dst
     maybeLoopIndependent = src.comesBefore(&dst);
@@ -443,9 +463,9 @@ static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> 
   for(int i=0;i<dag_scc.getNodeCount();i++){
     std::vector<int> adjacents = dag_scc.getAdjs(i);
     LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
-  for(size_t j=0;j<adjacents.size();j++)
-    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
-   LLVM_DEBUG(dbgs() <<"\n");
+    for(size_t j=0;j<adjacents.size();j++)
+      LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+    LLVM_DEBUG(dbgs() <<"\n");
   }
   
 	return dag_scc;
@@ -581,15 +601,147 @@ static DAG computeDAGscc(PDG graph) {
   for(int i=0;i<dag_scc.getNodeCount();i++){
     std::vector<int> adjacents = dag_scc.getAdjs(i);
     LLVM_DEBUG(dbgs() << "[psdswp] Adjacent nodes of " << i << ":");
-  for(size_t j=0;j<adjacents.size();j++)
-    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
-   LLVM_DEBUG(dbgs() <<"\n");
+    for(size_t j=0;j<adjacents.size();j++)
+      LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+    LLVM_DEBUG(dbgs() <<"\n");
   }
   
-  return connectEdges( graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
-
+  return connectEdges(graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 }
 
+static bool existsLongPath(DAG& graph, int src, int dst) {
+  std::set<int> considered;
+  considered.insert(src);
+  
+  std::queue<int> worklist;
+  for (int n : graph.getAdjs(src)) {
+    // Don't add the destination node in the first round since we only want
+    // to consider paths with at least one intermediate node
+    if (n != dst)
+      worklist.push(n);
+  }
+
+  while (!worklist.empty()) {
+    int idx = worklist.front(); worklist.pop();
+    considered.insert(idx);
+    if (idx == dst) return true;
+
+    for (int n : graph.getAdjs(idx)) {
+      if (considered.find(n) == considered.end()) {
+        worklist.push(n);
+      }
+    }
+  }
+
+  return false;
+}
+
+static DAG threadPartitioning(DAG dag) {
+  std::map<int, int> nodeToBlock;
+  std::map<int, std::set<int>> blockToNodes;
+  
+  std::set<int> doall_blocks;
+  std::set<int> sequential_blocks;
+
+  errs() << "In threadPartitioning()\n";
+
+  auto findEdgesBetweenBlocks = [&](int block1, int block2) {
+    std::vector<DAGEdge> edges;
+    for (int n1 : blockToNodes[block1]) {
+      for (int n2 : blockToNodes[block2]) {
+        std::vector<DAGEdge> edges1T2 = dag.getEdge(n1, n2);
+        std::vector<DAGEdge> edges2T1 = dag.getEdge(n2, n1);
+        edges.insert(edges.end(), edges1T2.begin(), edges1T2.end());
+        edges.insert(edges.end(), edges2T1.begin(), edges2T1.end());
+      }
+    }
+    return edges;
+  };
+  auto existsLongPathBlocks = [&](int block1, int block2) {
+    for (int n1 : blockToNodes[block1]) {
+      for (int n2 : blockToNodes[block2]) {
+        if (existsLongPath(dag, n1, n2) || existsLongPath(dag, n2, n1))
+          return false;
+      }
+    }
+    return true;
+  };
+  auto mergeBlocks = [&](int block1, int block2) {
+    blockToNodes[block1].insert(blockToNodes[block2].begin(),
+                                blockToNodes[block2].end());
+    for (int n1 : blockToNodes[block2]) {
+      nodeToBlock[n1] = block1;
+    }
+    blockToNodes.erase(blockToNodes.find(block2));
+  };
+
+  const int numNodes = dag.getNodeCount();
+  for (int i = 0; i < numNodes; i++) {
+    nodeToBlock[i] = i;
+    blockToNodes[i] = std::set<int>({i});
+    if (dag.getNode(i).doall) doall_blocks.insert(i);
+    else sequential_blocks.insert(i);
+  }
+
+  // Merge DOALL nodes
+  bool merged = false;
+  do {
+    errs() << "[psdswp] Entered do-while in threadPartitioning()\n";
+    merged = false;
+
+    auto it = doall_blocks.begin();
+    auto end = doall_blocks.end();
+    while (it != end) {
+      int firstBlock = *it;
+      
+      auto innerIt = it;
+      ++innerIt;
+      while (innerIt != end) {
+        int secondBlock = *innerIt;
+        
+        std::vector<DAGEdge> edges =
+            findEdgesBetweenBlocks(firstBlock, secondBlock);
+
+        // Check Condition 2 from the paper (no edges between them that represent
+        // loop-carried dependencies)
+        bool anyLoopCarried = false;
+        for (DAGEdge edge : edges) {
+          if (edge.loopCarried) {
+            anyLoopCarried = true;
+            break;
+          }
+        }
+        if (anyLoopCarried) { ++innerIt; continue; }
+
+        // Check Condition 1 from the paper (that there does not exist a path
+        // containing one or more intermediate nodes between the two candidates
+        if (existsLongPathBlocks(firstBlock, secondBlock))
+          { ++innerIt; continue; }
+        
+        // Merge the blocks
+        mergeBlocks(firstBlock, secondBlock);
+        innerIt = doall_blocks.erase(innerIt);
+        merged = true;
+        errs() << "[psdswp] Merged blocks " << firstBlock << " and " << secondBlock << "\n";
+      }
+      ++it;
+    }
+  } while (merged);
+
+  errs() << "[psdswp] After merging DOALL:\n";
+  for (auto it : blockToNodes) {
+    errs() << "\tBlock " << it.first << " : ";
+    for (int i : it.second) {
+      errs() << i << " ";
+    }
+    errs() << "\n";
+  }
+
+  // Reassign all but one parallel loop to be sequential
+  // Merge SEQUENTIAL nodes
+
+  return dag;
+}
 
 char PS_DSWP::ID = 0;
 
