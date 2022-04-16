@@ -448,6 +448,13 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
 
 static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> &scc_to_pdg_map, std::map<int, int> &pdg_to_scc_map){
 
+	for(int i=0;i<dag_scc.getNodeCount();i++){
+	  LLVM_DEBUG(dbgs() << "Node" << i );
+	  if (dag_scc.getNode(i).doall)
+	    LLVM_DEBUG(dbgs() << ": Doall" <<"\n");
+		else
+			LLVM_DEBUG(dbgs() << ": Sequential" <<"\n");
+	}
 	for(size_t i = 0;i<pdg_to_scc_map.size(); i++)
 		for(size_t j = 0; j < pdg_to_scc_map.size(); j++){
 			if(pdg_to_scc_map[i] == pdg_to_scc_map[j])
@@ -462,7 +469,7 @@ static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> 
   LLVM_DEBUG(dbgs() << " [psdswp] Number of nodes in DAG SCC the graph " << dag_scc.getNodeCount() << "\n");
   for(int i=0;i<dag_scc.getNodeCount();i++){
     std::vector<int> adjacents = dag_scc.getAdjs(i);
-    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+    LLVM_DEBUG(dbgs() << "[psdswp] Adjacent nodes of " << i << ":");
     for(size_t j=0;j<adjacents.size();j++)
       LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
     LLVM_DEBUG(dbgs() <<"\n");
@@ -565,9 +572,9 @@ static DAG computeDAGscc(PDG graph) {
   for(int i=0;i<graph.getNodeCount();i++){
     std::vector<int> adjacents = graph.getAdjs(i);
     LLVM_DEBUG(dbgs() << "[psdswp] Adjacent nodes of " << i << ":");
-  for(size_t j=0;j<adjacents.size();j++)
-    LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
-   LLVM_DEBUG(dbgs() <<"\n");
+    for(size_t j=0;j<adjacents.size();j++)
+      LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+    LLVM_DEBUG(dbgs() <<"\n");
   }
   
   	DAG dag_scc;
@@ -590,13 +597,13 @@ static DAG computeDAGscc(PDG graph) {
 	
 	// Call the recursive helper function to find strongly
 	// connected components in DFS tree with vertex 'i'
-	LLVM_DEBUG(dbgs() << "[psdswp] Strongly Connected Components");
+	LLVM_DEBUG(dbgs() << "[psdswp] Strongly Connected Components\n");
 	for (int i = 0; i < V; i++)
 		if (disc[i] == -1)
 			strongconnect(i, disc, low, st, stackMember, graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 			
 	
-	
+	/*	
   LLVM_DEBUG(dbgs() << "[psdswp] Number of nodes in the graph " << dag_scc.getNodeCount() << "\n");
   for(int i=0;i<dag_scc.getNodeCount();i++){
     std::vector<int> adjacents = dag_scc.getAdjs(i);
@@ -604,7 +611,7 @@ static DAG computeDAGscc(PDG graph) {
     for(size_t j=0;j<adjacents.size();j++)
       LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
     LLVM_DEBUG(dbgs() <<"\n");
-  }
+  } */
   
   return connectEdges(graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 }
@@ -642,6 +649,7 @@ static DAG threadPartitioning(DAG dag) {
   
   std::set<int> doall_blocks;
   std::set<int> sequential_blocks;
+  DAG dag_threaded;
 
   errs() << "In threadPartitioning()\n";
 
@@ -686,7 +694,7 @@ static DAG threadPartitioning(DAG dag) {
   // Merge DOALL nodes
   bool merged = false;
   do {
-    errs() << "[psdswp] Entered do-while in threadPartitioning()\n";
+    errs() << "[psdswp] Entered DOALL do-while in threadPartitioning()\n";
     merged = false;
 
     auto it = doall_blocks.begin();
@@ -736,11 +744,103 @@ static DAG threadPartitioning(DAG dag) {
     }
     errs() << "\n";
   }
+  
+  /*
+  //Naive approach - most number of nodes (Actually decide this based on max profile weight)
+  int max = -1;
+  int nodeIndex = -1;
+  for(size_t i = 0;i<blockToNodes.size(); i++)
+  	if(blockToNodes[i].size() > max){
+  		max = blockToNodes[i].size();
+  		nodeIndex = i;
+  		}
+  		
+  for(size_t i = 0;i<blockToNodes.size(); i++)
+  	if(i!=nodeIndex)
+  		doall_blocks.erase(i);
+  		sequential_blocks.insert(i);
+  */
+  
+  // Merge SEQUENTIAL nodes
+  bool mergedSeq = false;
+  do {
+    errs() << "[psdswp] Entered SEQUENTIAL do-while in  threadPartitioning()\n";
+    mergedSeq = false;
+
+    auto it = sequential_blocks.begin();
+    auto end = sequential_blocks.end();
+    while (it != end) {
+      int firstBlock = *it;
+      
+      auto innerIt = it;
+      ++innerIt;
+      while (innerIt != end) {
+        int secondBlock = *innerIt;
+        
+        // Check Condition 1 for valid assignment from the paper (that there does not exist a path
+        // containing one or more intermediate nodes between the two candidates
+        if (existsLongPathBlocks(firstBlock, secondBlock))
+          { ++innerIt; continue; }
+        
+        // Merge the blocks
+        mergeBlocks(firstBlock, secondBlock);
+        innerIt = sequential_blocks.erase(innerIt);
+        mergedSeq = true;
+        errs() << "[psdswp] Merged blocks " << firstBlock << " and " << secondBlock << "\n";
+      }
+      ++it;
+    }
+  } while (mergedSeq);
+  
+  errs() << "[psdswp] After merging SEQUENTIAL:\n";
+  for (auto it : blockToNodes) {
+    errs() << "\tBlock " << it.first << " : ";
+    for (int i : it.second) {
+      errs() << i << " ";
+    }
+    errs() << "\n";
+  }
+  
+  for(size_t i = 0;i<blockToNodes.size(); i++)
+  {
+    DAGNode combined;
+    std::vector<Instruction*> insts;
+    for(size_t j = 0;j<blockToNodes[i].size();j++)
+    {
+ 			insts.insert(insts.end(),  dag.getNode(j).insts.begin(),  dag.getNode(j).insts.end());
+  	}	
+    combined.insts = insts;
+    if(sequential_blocks.find(i) != sequential_blocks.end()) combined.doall = false;
+    else combined.doall = true;
+    dag_threaded.insertNode(combined);
+
+  }
+  
+  //Connect all edges, possibly repeats edges 
+  for(size_t i = 0;i<nodeToBlock.size(); i++)
+		for(size_t j = 0; j < nodeToBlock.size(); j++){
+			if(nodeToBlock[i] == nodeToBlock[j])
+				continue;
+			else{
+				std::vector<DAGEdge> edges = dag.getEdge(i , j);
+				for (size_t k = 0; k < edges.size(); k++)
+					dag_threaded.addEdge( nodeToBlock[i] , nodeToBlock[j] , edges[k] );
+					}
+			}
+
+  LLVM_DEBUG(dbgs() << " [psdswp] Number of nodes in DAG after thread partitioning " << dag_threaded.getNodeCount() << "\n");
+  for(int i=0;i<dag_threaded.getNodeCount();i++){
+    std::vector<int> adjacents = dag_threaded.getAdjs(i);
+    LLVM_DEBUG(dbgs() << "Adjacent nodes of " << i << ":");
+    for(size_t j=0;j<adjacents.size();j++)
+      LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
+    LLVM_DEBUG(dbgs() <<"\n");
+  }
 
   // Reassign all but one parallel loop to be sequential
-  // Merge SEQUENTIAL nodes
+  // Merge SEQUENTIAL nodes - Done, but with some commented out naive reassignments
 
-  return dag;
+  return dag_threaded;
 }
 
 char PS_DSWP::ID = 0;
