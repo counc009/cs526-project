@@ -24,6 +24,10 @@ namespace {
   cl::opt<unsigned int> numThreads("num-threads",
     cl::desc("Number of threads for PS-DSWP parallelization"),
     cl::value_desc("threads"));
+  // Acyclic Singly-Linked Lists
+  cl::list<std::string> singlyLinkedLists("asll", cl::NormalFormatting,
+    cl::desc("Mark a C struct as an acyclic singly-linked list"),
+    cl::value_desc("name"));
 
   struct PS_DSWP : public FunctionPass {
     static char ID; // Pass identification
@@ -220,11 +224,12 @@ using PDG = DiGraph<PDGNode, PDGEdge>;
 using DAG = DiGraph<DAGNode, DAGEdge>;
 
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
-                       ReverseDominanceFrontier&);
+                       ReverseDominanceFrontier&, std::set<Instruction*>&);
 static DAG computeDAGscc(PDG);
 static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&, std::map<int, int>&);
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
+static std::set<Instruction*> analyzeDataStructures(Loop* loop);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -245,8 +250,12 @@ bool PS_DSWP::runOnFunction(Function &F) {
   // For now, just considering the top level loops. Not actually sure if this
   // is correct behavior in general
   for (Loop* loop : LI.getTopLevelLoops()) {
+    // Determine which loads/stores cannot be loop-carried (based on the
+    // data-structure declarations)
+    std::set<Instruction*> nonLoopCarried = analyzeDataStructures(loop);
+
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
-    PDG pdg = generatePDG(loop, LI, DI, DT, RDF);
+    PDG pdg = generatePDG(loop, LI, DI, DT, RDF, nonLoopCarried);
 
     LLVM_DEBUG(dbgs() << "Performing SCCC Tests " << "\n");
     DAG dag_scc = computeDAGscc(pdg);
@@ -290,7 +299,8 @@ static bool liesBetween(const Instruction *From, Instruction *Between,
 static void checkMemoryDependence(Instruction& src, Instruction& dst,
                                   int srcNode, int dstNode,
                                   PDG& graph, BasicBlock* backedge,
-                                  DominatorTree& DT, DependenceInfo& DI) {
+                                  DominatorTree& DT, DependenceInfo& DI,
+                                  std::set<Instruction*>& nonLoopCarried) {
   // First, see if we can reach dst from src without traversing the back edge
   // LLVM supports checking reachability without traversing a set of basic
   // blocks, so we check reachability without entering the basic block that
@@ -321,31 +331,40 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     DI.depends(&src, &dst, maybeLoopIndependent);
   if (dependence != nullptr) {
     unsigned direction = dependence->getDirection(1);
-    LLVM_DEBUG(
-      std::string dirStr = "UNKNOWN";
-      switch (direction) {
-        case Dependence::DVEntry::NONE: dirStr = "NONE"; break;
-        case Dependence::DVEntry::LT:   dirStr = "LT"; break;
-        case Dependence::DVEntry::EQ:   dirStr = "EQ"; break;
-        case Dependence::DVEntry::LE:   dirStr = "LE"; break;
-        case Dependence::DVEntry::GT:   dirStr = "GT"; break;
-        case Dependence::DVEntry::NE:   dirStr = "NE"; break;
-        case Dependence::DVEntry::GE:   dirStr = "GE"; break;
-        case Dependence::DVEntry::ALL:  dirStr = "ALL"; break;
-      }
-      dbgs() << "[psdswp] Memory dependence from " << src << " to  " << dst
-             << (!dependence->isLoopIndependent() ? " (loop carried)" : "")
-             << " direction " << dirStr << "\n");
-    if (direction != Dependence::DVEntry::LT) {
-      // Only include dependence that aren't negative
-      graph.addEdge(srcNode, dstNode, PDGEdge{PDGEdge::Memory,
-                                        !dependence->isLoopIndependent()});
+    bool loopCarried = !dependence->isLoopIndependent();
+    if (nonLoopCarried.find(&src) != nonLoopCarried.end()
+        || nonLoopCarried.find(&dst) != nonLoopCarried.end()) {
+      loopCarried = false;
+    }
+    if (direction != Dependence::DVEntry::LT
+        && (loopCarried || (&src != &dst && !DT.dominates(&dst, &src)))) {
+      // Only include dependence that aren't negative or if the dependence
+      // isn't loop carried, only include ones where the dst doesn't dominate
+      // the src (i.e. exclude backwards dependences/non-carried self
+      // dependences)
+      graph.addEdge(srcNode, dstNode, PDGEdge{PDGEdge::Memory, loopCarried});
+      LLVM_DEBUG(
+        std::string dirStr = "UNKNOWN";
+        switch (direction) {
+          case Dependence::DVEntry::NONE: dirStr = "NONE"; break;
+          case Dependence::DVEntry::LT:   dirStr = "LT"; break;
+          case Dependence::DVEntry::EQ:   dirStr = "EQ"; break;
+          case Dependence::DVEntry::LE:   dirStr = "LE"; break;
+          case Dependence::DVEntry::GT:   dirStr = "GT"; break;
+          case Dependence::DVEntry::NE:   dirStr = "NE"; break;
+          case Dependence::DVEntry::GE:   dirStr = "GE"; break;
+          case Dependence::DVEntry::ALL:  dirStr = "ALL"; break;
+        }
+        dbgs() << "[psdswp] Memory dependence from " << src << " to  " << dst
+               << (loopCarried ? " (loop carried)" : "")
+               << " direction " << dirStr << "\n");
     }
   }
 }
 
 static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
-                       DominatorTree& DT, ReverseDominanceFrontier& RDF) {
+                       DominatorTree& DT, ReverseDominanceFrontier& RDF,
+                       std::set<Instruction*>& nonLoopCarried) {
   PDG graph;
 
   BasicBlock* incoming;
@@ -373,10 +392,10 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             int thisNode = nodes[&inst];
             int otherNode = nodes[other];
             checkMemoryDependence(inst, *other, thisNode, otherNode, graph,
-                                  backedge, DT, DI);
+                                  backedge, DT, DI, nonLoopCarried);
             if (thisNode != otherNode) {
               checkMemoryDependence(*other, inst, otherNode, thisNode, graph,
-                                    backedge, DT, DI);
+                                    backedge, DT, DI, nonLoopCarried);
             }
           }
         }
@@ -841,6 +860,68 @@ static DAG threadPartitioning(DAG dag) {
   // Merge SEQUENTIAL nodes - Done, but with some commented out naive reassignments
 
   return dag_threaded;
+}
+
+static std::set<Instruction*> analyzeDataStructures(Loop* loop) {
+  std::set<Instruction*> cannotBeLoopCarried;
+  std::set<Value*> notCarriedPointers;
+  for (BasicBlock* bb : loop->blocks()) {
+    // Variables that cannot be loop-carried are caused by phis
+    for (PHINode& phi : bb->phis()) {
+      bool isAcyclicLinkedList = false;
+
+      Type* phiType = phi.getType();
+      if (!phiType->isPointerTy()) continue;
+      StructType* ty = dyn_cast<StructType>(phiType->getPointerElementType());
+      if (ty && ty->hasName()) {
+        StringRef name = ty->getName();
+        if (name.startswith("struct.")) {
+          name = name.drop_front(7);
+          for (std::string listName : singlyLinkedLists) {
+            if (listName == name) { isAcyclicLinkedList = true; break; }
+          }
+        }
+      }
+
+      if (isAcyclicLinkedList) {
+        LLVM_DEBUG(dbgs() << "Found acyclic linked list phi: " << phi << "\n");
+        std::list<Instruction*> worklist;
+        worklist.push_back(&phi);
+
+        while (!worklist.empty()) {
+          Instruction* current = worklist.front();
+          worklist.pop_front();
+
+          if (notCarriedPointers.find(current) != notCarriedPointers.end())
+            continue;
+
+          if (!current->mayReadOrWriteMemory()) {
+            notCarriedPointers.insert(current);
+            for (Value* user : current->users()) {
+              Instruction* inst = dyn_cast<Instruction>(user);
+              if (!inst) continue;
+              worklist.push_back(inst);
+            }
+          } else if (StoreInst* store = dyn_cast<StoreInst>(current)) {
+            if (notCarriedPointers.find(store->getPointerOperand())
+                != notCarriedPointers.end()) {
+              cannotBeLoopCarried.insert(store);
+              LLVM_DEBUG(dbgs() << "Found store that cannot have loop-carried "
+                                   "dependence: " << *store << "\n");
+            }
+          } else if (LoadInst* load = dyn_cast<LoadInst>(current)) {
+            if (notCarriedPointers.find(load->getPointerOperand())
+                != notCarriedPointers.end()) {
+              cannotBeLoopCarried.insert(load);
+              LLVM_DEBUG(dbgs() << "Found load that cannot have loop-carried "
+                                   "dependence: " << *load << "\n");
+            }
+          }
+        }
+      }
+    }
+  }
+  return cannotBeLoopCarried;
 }
 
 char PS_DSWP::ID = 0;
