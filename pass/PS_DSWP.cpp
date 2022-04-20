@@ -635,22 +635,24 @@ static DAG computeDAGscc(PDG graph) {
   return connectEdges(graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 }
 
-static bool existsLongPath(DAG& graph, int src, int dst) {
-  std::set<int> considered;
-  considered.insert(src);
+static bool existsLongPathSet(DAG& graph, std::set<int> srcs,
+                              std::set<int> dsts) {
+  std::set<int> considered = srcs;
   
   std::queue<int> worklist;
-  for (int n : graph.getAdjs(src)) {
-    // Don't add the destination node in the first round since we only want
-    // to consider paths with at least one intermediate node
-    if (n != dst)
-      worklist.push(n);
+  for (int src : srcs) {
+    for (int n : graph.getAdjs(src)) {
+      // Don't add destination nodes in the first round since we only want to
+      // consider paths with at least one intermediate node
+      if (dsts.find(n) == dsts.end())
+        worklist.push(n);
+    }
   }
 
   while (!worklist.empty()) {
     int idx = worklist.front(); worklist.pop();
     considered.insert(idx);
-    if (idx == dst) return true;
+    if (dsts.find(idx) != dsts.end()) return true;
 
     for (int n : graph.getAdjs(idx)) {
       if (considered.find(n) == considered.end()) {
@@ -685,13 +687,8 @@ static DAG threadPartitioning(DAG dag) {
     return edges;
   };
   auto existsLongPathBlocks = [&](int block1, int block2) {
-    for (int n1 : blockToNodes[block1]) {
-      for (int n2 : blockToNodes[block2]) {
-        if (existsLongPath(dag, n1, n2) || existsLongPath(dag, n2, n1))
-          return false;
-      }
-    }
-    return true;
+    return existsLongPathSet(dag, blockToNodes[block1], blockToNodes[block2])
+        || existsLongPathSet(dag, blockToNodes[block2], blockToNodes[block1]);
   };
   auto mergeBlocks = [&](int block1, int block2) {
     blockToNodes[block1].insert(blockToNodes[block2].begin(),
@@ -795,6 +792,8 @@ static DAG threadPartitioning(DAG dag) {
       ++innerIt;
       while (innerIt != end) {
         int secondBlock = *innerIt;
+        errs() << "[psdswp] TRYING TO MERGE " << firstBlock << " and "
+               << secondBlock << "(" << existsLongPathBlocks(firstBlock, secondBlock) << ")\n";
         
         // Check Condition 1 for valid assignment from the paper (that there does not exist a path
         // containing one or more intermediate nodes between the two candidates
