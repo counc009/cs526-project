@@ -571,8 +571,8 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
 		pdg_to_scc_map.insert({w, len});
 				
 		
-		for(size_t i1 = 0; i1< node_maps.size();i1++)
-			for(size_t i2 = 0; i2< node_maps.size();i2++)
+    for (int i1 : node_maps)
+      for (int i2 : node_maps)
 				loopcarried = loopcarried || graph.hasLoopCarriedEdge(i1,i2);
 				//LLVM_DEBUG(dbgs() << loopcarried << "," << graph.hasLoopCarriedEdge(i1,i2) << ",");
 
