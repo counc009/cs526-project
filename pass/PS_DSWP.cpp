@@ -218,18 +218,34 @@ namespace {
       } while (!worklist.empty());
     }
   };
+
+  struct DataStructureAnalysis {
+    // Pointers that are updated on each iteration in such a way that it will
+    // point to a different element of the list (and so there are not
+    // loop-carried dependences based on these pointers)
+    // We map these back to the pointer they are derived from (or the pointer
+    // itself for the PHI's that induce this) to allow us to determine when
+    // two accesses must point to different elements
+    std::map<Value*, Value*> notCarriedPointers;
+    // For a given pointer, the set of pointers that point to elements further
+    // along (in a particular iteration)
+    std::map<Value*, std::set<Value*>> forwardPointers;
+    // For a given pointer, the set of pointers that point to elements behind
+    // it (in a particular iteration)
+    std::map<Value*, std::set<Value*>> backwardPointers;
+  };
 }
 
 using PDG = DiGraph<PDGNode, PDGEdge>;
 using DAG = DiGraph<DAGNode, DAGEdge>;
 
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
-                       ReverseDominanceFrontier&, std::set<Value*>&);
+                       ReverseDominanceFrontier&, DataStructureAnalysis&);
 static DAG computeDAGscc(PDG);
 static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&, std::map<int, int>&);
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
-static std::set<Value*> analyzeDataStructures(Loop* loop);
+static DataStructureAnalysis analyzeDataStructures(Loop* loop);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -252,10 +268,10 @@ bool PS_DSWP::runOnFunction(Function &F) {
   for (Loop* loop : LI.getTopLevelLoops()) {
     // Determine which loads/stores cannot be loop-carried (based on the
     // data-structure declarations)
-    std::set<Value*> nonLoopCarried = analyzeDataStructures(loop);
+    DataStructureAnalysis DSA = analyzeDataStructures(loop);
 
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
-    PDG pdg = generatePDG(loop, LI, DI, DT, RDF, nonLoopCarried);
+    PDG pdg = generatePDG(loop, LI, DI, DT, RDF, DSA);
 
     LLVM_DEBUG(dbgs() << "Performing SCCC Tests " << "\n");
     DAG dag_scc = computeDAGscc(pdg);
@@ -310,7 +326,7 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
                                   int srcNode, int dstNode,
                                   PDG& graph, BasicBlock* backedge,
                                   DominatorTree& DT, DependenceInfo& DI,
-                                  std::set<Value*>& nonLoopCarried) {
+                                  DataStructureAnalysis& DSA) {
   // First, see if we can reach dst from src without traversing the back edge
   // LLVM supports checking reachability without traversing a set of basic
   // blocks, so we check reachability without entering the basic block that
@@ -348,11 +364,26 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     Value* pointerSrc = getMemoryPointer(&src);
     Value* pointerDst = getMemoryPointer(&dst);
     if (pointerSrc != nullptr && pointerSrc == pointerDst &&
-        nonLoopCarried.find(pointerSrc) != nonLoopCarried.end()) {
+        DSA.notCarriedPointers.find(pointerSrc) != DSA.notCarriedPointers.end()) {
       LLVM_DEBUG(dbgs() << "Data-type analysis shows " << src << " and "
                         << dst << " do not have a loop-carried dependence\n");
       loopCarried = false;
+    } else if (pointerSrc != nullptr && pointerDst != nullptr) {
+      auto fSrc = DSA.notCarriedPointers.find(pointerSrc);
+      auto fDst = DSA.notCarriedPointers.find(pointerDst);
+      if (fSrc != DSA.notCarriedPointers.end()
+          && fDst != DSA.notCarriedPointers.end()) {
+        Value* derivedSrc = fSrc->second;
+        Value* derivedDst = fDst->second;
+        std::set<Value*>& forwardDst = DSA.forwardPointers[derivedDst];
+        if (forwardDst.find(derivedSrc) != forwardDst.end()) {
+          // If dst is referencing a prior element in the list, set direction
+          // to LT
+          direction = Dependence::DVEntry::LT;
+        }
+      }
     }
+
     if (direction != Dependence::DVEntry::LT
         && (loopCarried || (&src != &dst && !DT.dominates(&dst, &src)))) {
       // Only include dependence that aren't negative or if the dependence
@@ -379,13 +410,18 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
         dbgs() << "[psdswp] Memory dependence from " << src << " to  " << dst
                << (loopCarried ? " (loop carried)" : "")
                << " direction " << dirStr << "\n");
+    } else {
+      LLVM_DEBUG(
+      dbgs() << "DISCARDING dependence from " << src << " to " << dst
+             << (direction == Dependence::DVEntry::LT ? " was LT" : " wasn't LT")
+             << "\n");
     }
   }
 }
 
 static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                        DominatorTree& DT, ReverseDominanceFrontier& RDF,
-                       std::set<Value*>& nonLoopCarried) {
+                       DataStructureAnalysis& DSA) {
   PDG graph;
 
   BasicBlock* incoming;
@@ -413,10 +449,10 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             int thisNode = nodes[&inst];
             int otherNode = nodes[other];
             checkMemoryDependence(inst, *other, thisNode, otherNode, graph,
-                                  backedge, DT, DI, nonLoopCarried);
+                                  backedge, DT, DI, DSA);
             if (thisNode != otherNode) {
               checkMemoryDependence(*other, inst, otherNode, thisNode, graph,
-                                    backedge, DT, DI, nonLoopCarried);
+                                    backedge, DT, DI, DSA);
             }
           }
         }
@@ -905,8 +941,49 @@ static DAG threadPartitioning(DAG dag) {
   return dag_threaded;
 }
 
-static std::set<Value*> analyzeDataStructures(Loop* loop) {
-  std::set<Value*> notCarriedPointers;
+bool verifyPHIIteratesList(PHINode& phi, Loop* loop) {
+  // We know this phi's type is an acyclic linked list, we now want to verify
+  // that its value advances through the list each iteration
+  const unsigned incoming = phi.getNumIncomingValues();
+  for (unsigned i = 0; i < incoming; i++) {
+    const BasicBlock* block = phi.getIncomingBlock(i);
+    // Skip edges from outside the loop
+    if (!loop->contains(block)) continue;
+
+    Value* value = phi.getIncomingValue(i);
+    // From within the loop we want to verify that this value MUST be further
+    // into the list; we do this by ensuring that it is calculated through
+    // some number of loads and GEPs from this phi
+    
+    do {
+      if (LoadInst* load = dyn_cast<LoadInst>(value)) {
+        Value* ptr = load->getPointerOperand();
+        if (GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(ptr)) {
+          value = gep->getPointerOperand();
+        } else {
+          errs() << "WARNING: Found phi of an ASLL that's derived of a load not "
+                    "derived from a GEP: " << *ptr << "\n";
+          break;
+        }
+      } else {
+        errs() << "WARNING: Found phi of an ASLL that's not derived from a load: "
+               << *value << "\n";
+        break;
+      }
+    } while (value != &phi);
+
+    if (value != &phi) return false;
+  }
+
+  return true;
+}
+
+static DataStructureAnalysis analyzeDataStructures(Loop* loop) {
+  DataStructureAnalysis result;
+  std::map<Value*, Value*>& notCarriedPointers = result.notCarriedPointers;
+  std::map<Value*, std::set<Value*>>& forwardPointers = result.forwardPointers;
+  std::map<Value*, std::set<Value*>>& backwardPointers = result.backwardPointers;
+
   for (BasicBlock* bb : loop->blocks()) {
     // Variables that cannot be loop-carried are caused by phis
     for (PHINode& phi : bb->phis()) {
@@ -926,30 +1003,49 @@ static std::set<Value*> analyzeDataStructures(Loop* loop) {
       }
 
       if (isAcyclicLinkedList) {
+        if (!verifyPHIIteratesList(phi, loop)) continue;
+
         LLVM_DEBUG(dbgs() << "Found acyclic linked list phi: " << phi << "\n");
-        std::list<Instruction*> worklist;
-        worklist.push_back(&phi);
+        
+        // The phi and pointers derived from it (through GEPs) do not have loop
+        // carried dependences on themselves
+        std::list<Instruction*> pointers; pointers.push_back(&phi);
+        notCarriedPointers[&phi] = &phi;
 
-        while (!worklist.empty()) {
-          Instruction* current = worklist.front();
-          worklist.pop_front();
+        // Find all pointers derived from the PHI through GEPs or derived from
+        // it through loads of next elements (these are loads from pointers
+        // derived from the PHI that have the same type as the PHI)
+        for (Instruction* pointer : pointers) {
+          Value* derivedFrom = notCarriedPointers[pointer];
+          for (Value* user : pointer->users()) {
+            LoadInst* load = dyn_cast<LoadInst>(user);
+            GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(user);
+            if (load && load->getType() == phi.getType()) {
+              // so, this load is a pointer to a later element of this list
+              forwardPointers[derivedFrom].insert(load);
+              backwardPointers[load].insert(derivedFrom);
 
-          if (notCarriedPointers.find(current) != notCarriedPointers.end())
-            continue;
+              for (Value* backwards : backwardPointers[derivedFrom]) {
+                forwardPointers[backwards].insert(load);
+                backwardPointers[load].insert(backwards);
+              }
 
-          if (!current->mayReadOrWriteMemory()) {
-            notCarriedPointers.insert(current);
-            for (Value* user : current->users()) {
-              Instruction* inst = dyn_cast<Instruction>(user);
-              if (!inst) continue;
-              worklist.push_back(inst);
+              // Since this is derived from the iteration through the loop,
+              // this pointer also cannot write to the same location in future
+              // iterations
+              notCarriedPointers[load] = load;
+              pointers.push_back(load);
+            } else if (gep) {
+              notCarriedPointers[gep] = derivedFrom;
+              pointers.push_back(gep);
             }
           }
         }
       }
     }
   }
-  return notCarriedPointers;
+
+  return result;
 }
 
 char PS_DSWP::ID = 0;
