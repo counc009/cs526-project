@@ -224,12 +224,12 @@ using PDG = DiGraph<PDGNode, PDGEdge>;
 using DAG = DiGraph<DAGNode, DAGEdge>;
 
 static PDG generatePDG(Loop*, LoopInfo&, DependenceInfo&, DominatorTree&,
-                       ReverseDominanceFrontier&, std::set<Instruction*>&);
+                       ReverseDominanceFrontier&, std::set<Value*>&);
 static DAG computeDAGscc(PDG);
 static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, std::map<int, std::vector<int>>&, std::map<int, int>&);
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
-static std::set<Instruction*> analyzeDataStructures(Loop* loop);
+static std::set<Value*> analyzeDataStructures(Loop* loop);
 
 bool PS_DSWP::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
@@ -252,7 +252,7 @@ bool PS_DSWP::runOnFunction(Function &F) {
   for (Loop* loop : LI.getTopLevelLoops()) {
     // Determine which loads/stores cannot be loop-carried (based on the
     // data-structure declarations)
-    std::set<Instruction*> nonLoopCarried = analyzeDataStructures(loop);
+    std::set<Value*> nonLoopCarried = analyzeDataStructures(loop);
 
     LLVM_DEBUG(dbgs() << "[psdswp] Running on loop " << *loop << "\n");
     PDG pdg = generatePDG(loop, LI, DI, DT, RDF, nonLoopCarried);
@@ -296,11 +296,21 @@ static bool liesBetween(const Instruction *From, Instruction *Between,
   return !isPotentiallyReachable(From, To, &Exclusion, DT);
 }
 
+static Value* getMemoryPointer(Instruction* inst) {
+  if (StoreInst* store = dyn_cast<StoreInst>(inst)) {
+    return store->getPointerOperand();
+  } else if (LoadInst* load = dyn_cast<LoadInst>(inst)) {
+    return load->getPointerOperand();
+  } else {
+    return nullptr;
+  }
+}
+
 static void checkMemoryDependence(Instruction& src, Instruction& dst,
                                   int srcNode, int dstNode,
                                   PDG& graph, BasicBlock* backedge,
                                   DominatorTree& DT, DependenceInfo& DI,
-                                  std::set<Instruction*>& nonLoopCarried) {
+                                  std::set<Value*>& nonLoopCarried) {
   // First, see if we can reach dst from src without traversing the back edge
   // LLVM supports checking reachability without traversing a set of basic
   // blocks, so we check reachability without entering the basic block that
@@ -331,9 +341,16 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     DI.depends(&src, &dst, maybeLoopIndependent);
   if (dependence != nullptr) {
     unsigned direction = dependence->getDirection(1);
-    bool loopCarried = !dependence->isLoopIndependent();
-    if (nonLoopCarried.find(&src) != nonLoopCarried.end()
-        || nonLoopCarried.find(&dst) != nonLoopCarried.end()) {
+    bool loopCarried = !dependence->isLoopIndependent() || !maybeLoopIndependent;
+
+    // The condition should actually be that they use the same pointer and that
+    // pointer is known to vary by iteration
+    Value* pointerSrc = getMemoryPointer(&src);
+    Value* pointerDst = getMemoryPointer(&dst);
+    if (pointerSrc != nullptr && pointerSrc == pointerDst &&
+        nonLoopCarried.find(pointerSrc) != nonLoopCarried.end()) {
+      LLVM_DEBUG(dbgs() << "Data-type analysis shows " << src << " and "
+                        << dst << " do not have a loop-carried dependence\n");
       loopCarried = false;
     }
     if (direction != Dependence::DVEntry::LT
@@ -342,6 +359,10 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
       // isn't loop carried, only include ones where the dst doesn't dominate
       // the src (i.e. exclude backwards dependences/non-carried self
       // dependences)
+      // Basically all of these cases are ones where either the dependence
+      // doesn't matter to our analysis or the other direction will get
+      // put in and adding both may unecessarily create a cycle that forces
+      // sequentialization
       graph.addEdge(srcNode, dstNode, PDGEdge{PDGEdge::Memory, loopCarried});
       LLVM_DEBUG(
         std::string dirStr = "UNKNOWN";
@@ -364,7 +385,7 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
 
 static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                        DominatorTree& DT, ReverseDominanceFrontier& RDF,
-                       std::set<Instruction*>& nonLoopCarried) {
+                       std::set<Value*>& nonLoopCarried) {
   PDG graph;
 
   BasicBlock* incoming;
@@ -861,8 +882,7 @@ static DAG threadPartitioning(DAG dag) {
   return dag_threaded;
 }
 
-static std::set<Instruction*> analyzeDataStructures(Loop* loop) {
-  std::set<Instruction*> cannotBeLoopCarried;
+static std::set<Value*> analyzeDataStructures(Loop* loop) {
   std::set<Value*> notCarriedPointers;
   for (BasicBlock* bb : loop->blocks()) {
     // Variables that cannot be loop-carried are caused by phis
@@ -901,26 +921,12 @@ static std::set<Instruction*> analyzeDataStructures(Loop* loop) {
               if (!inst) continue;
               worklist.push_back(inst);
             }
-          } else if (StoreInst* store = dyn_cast<StoreInst>(current)) {
-            if (notCarriedPointers.find(store->getPointerOperand())
-                != notCarriedPointers.end()) {
-              cannotBeLoopCarried.insert(store);
-              LLVM_DEBUG(dbgs() << "Found store that cannot have loop-carried "
-                                   "dependence: " << *store << "\n");
-            }
-          } else if (LoadInst* load = dyn_cast<LoadInst>(current)) {
-            if (notCarriedPointers.find(load->getPointerOperand())
-                != notCarriedPointers.end()) {
-              cannotBeLoopCarried.insert(load);
-              LLVM_DEBUG(dbgs() << "Found load that cannot have loop-carried "
-                                   "dependence: " << *load << "\n");
-            }
           }
         }
       }
     }
   }
-  return cannotBeLoopCarried;
+  return notCarriedPointers;
 }
 
 char PS_DSWP::ID = 0;
