@@ -782,21 +782,33 @@ static DAG threadPartitioning(DAG dag) {
     errs() << "\n";
   }
   
-  /*
-  //Naive approach - most number of nodes (Actually decide this based on max profile weight)
+  
+  //Naive approach - most number of instructions (Actually decide this based on max profile weight)
   int max = -1;
   int nodeIndex = -1;
-  for(size_t i = 0;i<blockToNodes.size(); i++)
-  	if(blockToNodes[i].size() > max){
-  		max = blockToNodes[i].size();
-  		nodeIndex = i;
+  for (auto it : doall_blocks) {
+  	int count = 0;
+  	for( auto node : blockToNodes[it] ){
+  		//errs() << "[psdswp] size " << dag.getNode(node).insts.size();
+  		count += dag.getNode(node).insts.size();
   		}
-  		
-  for(size_t i = 0;i<blockToNodes.size(); i++)
-  	if(i!=nodeIndex)
-  		doall_blocks.erase(i);
-  		sequential_blocks.insert(i);
-  */
+  	if (count > max){
+  		max = count;
+  		nodeIndex = it;
+  		}
+  	}
+  if(max != -1){
+		errs() << "[psdswp] Max Profile block " << nodeIndex << " number of instructions  " << max << "\n";
+		for (auto it : doall_blocks) {
+			if(it!=nodeIndex)
+				{
+				errs() << "[psdswp] Converting block from doall to sequential " << it << "\n";
+				doall_blocks.erase(it);
+				sequential_blocks.insert(it);
+				}
+  	}
+  }
+
   
   // Merge SEQUENTIAL nodes
   bool mergedSeq = false;
@@ -839,33 +851,44 @@ static DAG threadPartitioning(DAG dag) {
     }
     errs() << "\n";
   }
-  
-  for(size_t i = 0;i<blockToNodes.size(); i++)
+  //errs() << "[psdswp] Node to block size " << nodeToBlock.size()<< "\n";
+  //errs() << "[psdswp] Block to node size :" << blockToNodes.size()<< "\n";
+  for (auto it : blockToNodes) 
   {
     DAGNode combined;
     std::vector<Instruction*> insts;
-    for(size_t j = 0;j<blockToNodes[i].size();j++)
+    for (int j : it.second)
     {
  			insts.insert(insts.end(),  dag.getNode(j).insts.begin(),  dag.getNode(j).insts.end());
+ 			nodeToBlock[j] = dag_threaded.getNodeCount();
   	}	
     combined.insts = insts;
-    if(sequential_blocks.find(i) != sequential_blocks.end()) combined.doall = false;
+    if(sequential_blocks.find(it.first) != sequential_blocks.end()) combined.doall = false;
     else combined.doall = true;
     dag_threaded.insertNode(combined);
 
   }
   
+  for(auto it1 : nodeToBlock)
+		errs() << "[psdswp] node to blocks :" << it1.first << "->"<< it1.second <<  "\n";
+	
+
+
   //Connect all edges, possibly repeats edges 
-  for(size_t i = 0;i<nodeToBlock.size(); i++)
-		for(size_t j = 0; j < nodeToBlock.size(); j++){
-			if(nodeToBlock[i] == nodeToBlock[j])
+  for(auto it1 : nodeToBlock){
+		for(auto it2 : nodeToBlock){
+			if(nodeToBlock[it1.first] == nodeToBlock[it2.first])
 				continue;
 			else{
-				std::vector<DAGEdge> edges = dag.getEdge(i , j);
+				std::vector<DAGEdge> edges = dag.getEdge(it1.first , it2.first);
 				for (size_t k = 0; k < edges.size(); k++)
-					dag_threaded.addEdge( nodeToBlock[i] , nodeToBlock[j] , edges[k] );
+				{  //errs() << "[psdswp] Adding edge from " << it1.first << " and " <<it2.first << " to " <<it1.second << " and " << it2.second <<"\n";
+					dag_threaded.addEdge( nodeToBlock[it1.first] , nodeToBlock[it2.first] , edges[k] );
 					}
+				}
 			}
+			}
+
 
   LLVM_DEBUG(dbgs() << " [psdswp] Number of nodes in DAG after thread partitioning " << dag_threaded.getNodeCount() << "\n");
   for(int i=0;i<dag_threaded.getNodeCount();i++){
