@@ -488,6 +488,41 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
           }
         }
       }
+
+      // For PHIs we insert additional register edges from the branch to the
+      // PHI, since the branch that we took to get to the PHI matters. This is
+      // in addition to the dependences on the actual values that the PHI can
+      // take
+      if (PHINode* phi = dyn_cast<PHINode>(&inst)) {
+        for (BasicBlock* bb : phi->blocks()) {
+          if (loop->contains(bb)) {
+            Instruction* term = bb->getTerminator();
+            auto f = nodes.find(term);
+            if (f != nodes.end()) {
+              bool carried = bb == backedge;
+              graph.addEdge(f->second, node, PDGEdge(PDGEdge::Register, carried));
+              LLVM_DEBUG(
+                dbgs() << "[psdswp] PHI control dependence from " << *term
+                       << " to " << *phi << (carried?" (loop carried)\n":"\n"));
+            }
+          }
+        }
+      } else if (BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+        for (BasicBlock* bb : branch->successors()) {
+          if (loop->contains(bb)) {
+            for (PHINode& phi : bb->phis()) {
+              auto f = nodes.find(&phi);
+              if (f != nodes.end()) {
+                bool carried = branch->getParent() == backedge;
+                graph.addEdge(node, f->second, PDGEdge(PDGEdge::Register, carried));
+                LLVM_DEBUG(
+                  dbgs() << "[psdswp] PHI control dependence from " << *branch
+                         << " to " << phi << (carried?" (loop carried)\n":"\n"));
+              }
+            }
+          }
+        }
+      }
     }
   }
 
