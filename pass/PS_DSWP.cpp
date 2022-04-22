@@ -49,7 +49,7 @@ namespace {
     PDGNode(Instruction* i) : inst(i) {}
   };
   struct PDGEdge {
-    enum Type { Register, Memory, Control };
+    enum Type { Register, Memory, Control, PHI };
     Type dependence;
     bool loopCarried;
     PDGEdge(Type dep, bool carried) : dependence(dep), loopCarried(carried) {}
@@ -500,7 +500,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             auto f = nodes.find(term);
             if (f != nodes.end()) {
               bool carried = bb == backedge;
-              graph.addEdge(f->second, node, PDGEdge(PDGEdge::Register, carried));
+              graph.addEdge(f->second, node, PDGEdge(PDGEdge::PHI, carried));
               LLVM_DEBUG(
                 dbgs() << "[psdswp] PHI control dependence from " << *term
                        << " to " << *phi << (carried?" (loop carried)\n":"\n"));
@@ -514,7 +514,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
               auto f = nodes.find(&phi);
               if (f != nodes.end()) {
                 bool carried = branch->getParent() == backedge;
-                graph.addEdge(node, f->second, PDGEdge(PDGEdge::Register, carried));
+                graph.addEdge(node, f->second, PDGEdge(PDGEdge::PHI, carried));
                 LLVM_DEBUG(
                   dbgs() << "[psdswp] PHI control dependence from " << *branch
                          << " to " << phi << (carried?" (loop carried)\n":"\n"));
