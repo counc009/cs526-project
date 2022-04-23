@@ -20,6 +20,7 @@ int64_t consume(void* syncArrays, int fromArray, int fromRepl);
 
 // Providing the function definitions in the header means LLVM won't just
 // delete the unused declarations
+
 struct syncArrayElem {
   int64_t val;
   struct syncArrayElem* prev;
@@ -33,7 +34,9 @@ struct syncArray {
   pthread_cond_t empty;
 };
 
-void* createSyncArrays(int numArrays, ...) {
+// Marking as optNone to avoid us trying to parallelize these, annoying since
+// optnone prevents all optimizations (TODO: find some other way?)
+void* createSyncArrays(int numArrays, ...) __attribute__((optnone)) {
   struct syncArray** syncArrays = malloc(sizeof(struct syncArray*) * numArrays);
 
   va_list args;
@@ -58,7 +61,7 @@ void* createSyncArrays(int numArrays, ...) {
   return syncArrays;
 }
 
-void freeSyncArrays(void* syncArrays, int numArrays, ...) {
+void freeSyncArrays(void* syncArrays, int numArrays, ...) __attribute__((optnone)) {
   struct syncArray** pipelines = (struct syncArray**) syncArrays;
   
   va_list args;
@@ -77,7 +80,7 @@ void freeSyncArrays(void* syncArrays, int numArrays, ...) {
   free(pipelines);
 }
 
-void produce(void* syncArrays, int toArray, int toRepl, int64_t value) {
+void produce(void* syncArrays, int toArray, int toRepl, int64_t value) __attribute__((optnone)) {
   struct syncArray** pipelines = (struct syncArray**) syncArrays;
   struct syncArray* syncArray = &(pipelines[toArray][toRepl]);
 
@@ -95,7 +98,7 @@ void produce(void* syncArrays, int toArray, int toRepl, int64_t value) {
   pthread_mutex_unlock(&syncArray->lock);
 }
 
-int64_t consume(void* syncArrays, int fromArray, int fromRepl) {
+int64_t consume(void* syncArrays, int fromArray, int fromRepl) __attribute__((optnone)) {
   struct syncArray** pipelines = (struct syncArray**) syncArrays;
   struct syncArray* syncArray = &(pipelines[fromArray][fromRepl]);
 
