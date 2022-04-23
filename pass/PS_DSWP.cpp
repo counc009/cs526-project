@@ -11,6 +11,7 @@
 #include "llvm/Support/GraphWriter.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 #include <map>
 #include <queue>
@@ -52,7 +53,9 @@ namespace {
     enum Type { Register, Memory, Control, PHI };
     Type dependence;
     bool loopCarried;
-    PDGEdge(Type dep, bool carried) : dependence(dep), loopCarried(carried) {}
+    Instruction *src, *dst;
+    PDGEdge(Type dep, bool carried, Instruction* s, Instruction* d)
+      : dependence(dep), loopCarried(carried), src(s), dst(d) {}
   };
 
   struct DAGNode {
@@ -246,8 +249,15 @@ static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, st
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
 static DataStructureAnalysis analyzeDataStructures(Loop* loop);
+static bool performParallelization(DAG partition, Loop* loop);
 
 bool PS_DSWP::runOnFunction(Function &F) {
+  if (F.hasFnAttribute(Attribute::OptimizeNone)) {
+    LLVM_DEBUG(dbgs() << "[psdswp] Skipping function " << F.getName()
+                      << " (marked optnone)\n");
+    return false;
+  }
+
   LLVM_DEBUG(dbgs() << "[psdswp] Running on function " << F.getName() << "!\n");
   if (numThreads < 2) {
     errs() << "PS-DSWP pass skipped since it was does not run with less than "
@@ -279,8 +289,12 @@ bool PS_DSWP::runOnFunction(Function &F) {
 
     LLVM_DEBUG(dbgs() << "[psdswp] Partitioning graph\n");
     DAG partitioned = threadPartitioning(dag_scc);
-    
-    // TODO: code-gen, etc.
+    if (partitioned.getNodeCount() <= 1) continue;
+    if (partitioned.getNodeCount() > numThreads) continue;
+    // TODO: Should probably have another performance estimate here to predict
+    // whether this will actually perform result in a speed-up
+
+    modified |= performParallelization(partitioned, loop);
   }
 
   return modified;
@@ -394,7 +408,8 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
       // doesn't matter to our analysis or the other direction will get
       // put in and adding both may unecessarily create a cycle that forces
       // sequentialization
-      graph.addEdge(srcNode, dstNode, PDGEdge{PDGEdge::Memory, loopCarried});
+      graph.addEdge(srcNode, dstNode,
+                    PDGEdge{PDGEdge::Memory, loopCarried, &src, &dst});
       LLVM_DEBUG(
         std::string dirStr = "UNKNOWN";
         switch (direction) {
@@ -467,7 +482,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
           if (f != nodes.end()) {
             bool carried = isLoopCarriedRegister(op, &inst, backedge);
             // Direction, register value written in op used in inst
-            graph.addEdge(f->second, node, PDGEdge(PDGEdge::Register, carried));
+            graph.addEdge(f->second, node,
+                          PDGEdge(PDGEdge::Register, carried, opInst, &inst));
             LLVM_DEBUG(
               dbgs() << "[psdswp] Register dependence from " << *opInst
                      << " to " << inst << (carried?" (loop carried)\n":"\n")); 
@@ -481,7 +497,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
           if (f != nodes.end()) {
             bool carried = isLoopCarriedRegister(use, useInst, backedge);
             // Direction, register value written in inst used in use
-            graph.addEdge(node, f->second, PDGEdge(PDGEdge::Register, carried));
+            graph.addEdge(node, f->second,
+                          PDGEdge(PDGEdge::Register, carried, &inst, useInst));
             LLVM_DEBUG(
               dbgs() << "[psdswp] Register dependence from " << inst << " to "
                      << *useInst << (carried ? " (loop carried)\n" : "\n")); 
@@ -500,7 +517,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             auto f = nodes.find(term);
             if (f != nodes.end()) {
               bool carried = bb == backedge;
-              graph.addEdge(f->second, node, PDGEdge(PDGEdge::PHI, carried));
+              graph.addEdge(f->second, node,
+                            PDGEdge(PDGEdge::PHI, carried, term, phi));
               LLVM_DEBUG(
                 dbgs() << "[psdswp] PHI control dependence from " << *term
                        << " to " << *phi << (carried?" (loop carried)\n":"\n"));
@@ -514,7 +532,8 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
               auto f = nodes.find(&phi);
               if (f != nodes.end()) {
                 bool carried = branch->getParent() == backedge;
-                graph.addEdge(node, f->second, PDGEdge(PDGEdge::PHI, carried));
+                graph.addEdge(node, f->second,
+                              PDGEdge(PDGEdge::PHI, carried, branch, &phi));
                 LLVM_DEBUG(
                   dbgs() << "[psdswp] PHI control dependence from " << *branch
                          << " to " << phi << (carried?" (loop carried)\n":"\n"));
@@ -543,7 +562,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                                        backedge->getTerminator(), &DT);
         for (Instruction& inst : *bb) {
           graph.addEdge(f->second, nodes[&inst],
-                        PDGEdge(PDGEdge::Control, loopCarried));
+                        PDGEdge(PDGEdge::Control, loopCarried, terminator, &inst));
           LLVM_DEBUG(
             dbgs() << "[psdswp] Control dependence from " << *terminator
                    << " to " << inst
@@ -1081,6 +1100,189 @@ static DataStructureAnalysis analyzeDataStructures(Loop* loop) {
   }
 
   return result;
+}
+
+static bool performParallelization(DAG partition, Loop* loop) {
+  // This map tracks the synchronization arrays and which values they represent
+  // and in what stage (the value and stage are the key, the value is the number
+  // of the synchronization array)
+  std::map<std::pair<Value*, int>, int> syncArrays;
+  std::vector<int> nodeRepls; // Replication factor of each node
+  int numSyncArrays = 0;
+
+  const int numNodes = partition.getNodeCount();
+  Module& M = *(loop->getHeader()->getModule());
+  Function& F = *(loop->getHeader()->getParent());
+
+  for (int i = 0; i < numNodes; i++) {
+    if (partition.getNode(i).doall) {
+      nodeRepls.push_back(numThreads - (numNodes-1));
+    } else {
+      nodeRepls.push_back(1);
+    }
+  }
+
+  // We need to traverse in reverse-topological order so that we assign
+  // synchronization arrays before we need to produce values into them
+  // This is Kahn's Algorithm
+  // (see https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm)
+  std::vector<int> order;
+  std::list<int> s;
+
+  // Find number of incoming edges for each node in the partitioned graph
+  // Also, init set s to contain the nodes with no incoming edges
+  std::vector<int> numIncoming;
+  std::vector<std::vector<DAGEdge>> incomingEdges;
+  for (int i = 0; i < numNodes; i++) {
+    int numEdges = 0;
+    incomingEdges.push_back(std::vector<DAGEdge>{});
+    for (int j = 0; j < numNodes; j++) {
+      std::vector<DAGEdge> edges = partition.getEdge(j, i);
+      // Only count one edge for simplicity
+      if (!edges.empty()) numEdges++;
+      incomingEdges[i].insert(incomingEdges[i].end(), edges.begin(), edges.end());
+    }
+    numIncoming.push_back(numEdges);
+    if (numEdges == 0) s.push_back(i);
+  }
+
+  assert(!s.empty() && "Found no source nodes in the partition");
+
+  while (!s.empty()) {
+    int n = s.front(); s.pop_front();
+    order.push_back(n);
+    for (int m : partition.getAdjs(n)) {
+      numIncoming[m] -= 1;
+      if (numIncoming[m] == 0) s.push_back(m);
+    }
+  }
+
+  for (int n : numIncoming) {
+    assert(n == 0 && "Failed to construct topological sort");
+  }
+
+  // We emit a function for each stage, it takes a struct containing all values
+  // we use defined outside of the loop and the index of this instance
+  // Traversing in reverse-topological order
+  for (auto it = order.rbegin(), end = order.rend(); it != end; ++it) {
+    int n = *it;
+    DAGNode& node = partition.getNode(n);
+    errs() << "Code-generating for node " << n << "\n";
+
+    std::vector<DAGEdge>& inEdges = incomingEdges[n];
+
+    // Classify the edges for handling (this also deduplicates dependence on 
+    // the same instruction from multiple instructions in this node)
+    std::map<Instruction*, std::vector<Instruction*>> regDependences;
+    std::map<Instruction*, std::vector<Instruction*>> memDependences;
+    std::map<Instruction*, std::vector<Instruction*>> controlDependences;
+    std::map<Instruction*, std::vector<Instruction*>> phiDependences;
+
+    for (DAGEdge& edge : inEdges) {
+      switch (edge.dependence) {
+        case DAGEdge::Type::Register: {
+            regDependences[edge.src].push_back(edge.dst);
+          }; break;
+        case DAGEdge::Type::Memory: {
+            memDependences[edge.src].push_back(edge.dst);
+          }; break;
+        case DAGEdge::Type::Control: {
+            controlDependences[edge.src].push_back(edge.dst);
+          }; break;
+        case DAGEdge::Type::PHI: {
+            phiDependences[edge.src].push_back(edge.dst);
+          }; break;
+      }
+    }
+
+    // Find all values from outside the loop-nest that are needed in this
+    // partition. These become arguments to the node function
+    std::set<Value*> outsideValues;
+    for (Instruction* inst : node.insts) {
+      for (Value* v : inst->operands()) {
+        Argument* arg = dyn_cast<Argument>(v);
+        Instruction* ins = dyn_cast<Instruction>(v);
+        // Any value other than an arg or an instruction is either global or
+        // constant (or a basic block, which is technically the later)
+        if (arg || (ins && !loop->contains(ins))) {
+          outsideValues.insert(v);
+        }
+      }
+    }
+    
+    // Function's input struct
+    std::vector<Type*> structFields; std::vector<Value*> structValues;
+    
+    // Add the instance number as the first argument
+    structFields.push_back(Type::getInt32Ty(M.getContext()));
+    // And an i8* (void*) for the synchronization arrays
+    structFields.push_back(Type::getInt8Ty(M.getContext())->getPointerTo());
+
+    for (Value* val : outsideValues) {
+      structFields.push_back(val->getType());
+      structValues.push_back(val);
+    }
+
+    StructType* inputStructTy = StructType::create(M.getContext(),
+         ArrayRef<Type*>(structFields),
+         (loop->getName() + ".par.stage" + std::to_string(n) + ".args").str());
+    PointerType* voidPtr = Type::getInt8Ty(M.getContext())->getPointerTo();
+    // Takes and returns i8* to match POSIX pthread launch (which technically
+    // takes void*, but LLVM interprets as i8*)
+    FunctionType* funcType =
+      FunctionType::get(voidPtr, ArrayRef<Type*>(voidPtr), false);
+    Function* func =
+      Function::Create(funcType,
+        GlobalValue::LinkageTypes::ExternalLinkage, // unecessary?
+        loop->getName() + ".par.stage" + std::to_string(n), M);
+    
+    BasicBlock* entry = BasicBlock::Create(M.getContext(), "entry", func);
+    // Cast argument to struct type
+    CastInst* inputPtr = BitCastInst::CreatePointerCast(func->getArg(0),
+                            inputStructTy->getPointerTo(), "stage.arg",
+                            entry);
+    
+    // Load the values out of the struct
+    ValueToValueMapTy vmap;
+    int i = 2;
+    Type* tyI32 = Type::getInt32Ty(M.getContext());
+    
+    std::vector<Value*> gepIdx;
+    gepIdx.push_back(ConstantInt::get(tyI32, 0));
+    gepIdx.push_back(ConstantInt::get(tyI32, 0));
+    
+    for (Value* value : structValues) {
+      gepIdx[1] = ConstantInt::get(tyI32, i);
+      GetElementPtrInst* gep =
+        GetElementPtrInst::Create(inputStructTy, inputPtr,
+                                  ArrayRef<Value*>(gepIdx), "", entry);
+      vmap[value] = new LoadInst(value->getType(), gep, value->getName(),
+                                 entry);
+      i++;
+    }
+
+    // And load the index (at index 0) and the synchronization arrays (index 1)
+    gepIdx[1] = ConstantInt::get(tyI32, 0);
+    LoadInst* instance =
+      new LoadInst(tyI32,
+        GetElementPtrInst::Create(inputStructTy, inputPtr,
+                                  ArrayRef<Value*>(gepIdx), "", entry),
+        "par.inst", entry);
+    gepIdx[1] = ConstantInt::get(tyI32, 1);
+    LoadInst* arrays =
+      new LoadInst(Type::getInt8Ty(M.getContext())->getPointerTo(),
+        GetElementPtrInst::Create(inputStructTy, inputPtr,
+                                  ArrayRef<Value*>(gepIdx), "", entry),
+        "par.arrays", entry);
+
+    // TODO: Actual code-gen
+
+    // Return NULL
+    ReturnInst::Create(M.getContext(), ConstantPointerNull::get(voidPtr),
+      entry);
+  }
+
+  return true;
 }
 
 char PS_DSWP::ID = 0;
