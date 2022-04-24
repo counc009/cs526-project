@@ -35,7 +35,8 @@ namespace {
     static char ID; // Pass identification
     PS_DSWP() : FunctionPass(ID) {}
 
-    FunctionCallee createSyncArrays, freeSyncArrays, produce, consume;
+    FunctionCallee createSyncArrays, freeSyncArrays, produce, consume,
+                   launchStage, waitForStage;
 
     // Entry point for the overall scalar-replacement pass
     bool runOnFunction(Function &F);
@@ -282,6 +283,18 @@ void PS_DSWP::initializeParFuncs(Module& M) {
   FunctionType* consumeTy
       = FunctionType::get(tyI64, ArrayRef<Type*>(consumeArgs), false);
   consume = M.getOrInsertFunction("consume", consumeTy);
+  
+  Type* funcI8PtrToI8Ptr
+    = FunctionType::get(tyI8Ptr, ArrayRef<Type*>(tyI8Ptr), false)->getPointerTo();
+  std::vector<Type*> launchArgs = {tyI8Ptr, funcI8PtrToI8Ptr};
+  FunctionType* launchTy
+      = FunctionType::get(tyI64, ArrayRef<Type*>(launchArgs), false);
+  launchStage = M.getOrInsertFunction("launchStage", launchTy);
+  
+  std::vector<Type*> waitArgs = {tyI64};
+  FunctionType* waitTy
+      = FunctionType::get(tyVoid, ArrayRef<Type*>(waitArgs), false);
+  waitForStage = M.getOrInsertFunction("waitForStage", waitTy);
 }
 
 bool PS_DSWP::runOnFunction(Function &F) {
@@ -1185,9 +1198,18 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
   // This map tracks the synchronization arrays and which values they represent
   // and in what stage (the value and stage are the key, the value is the number
   // of the synchronization array)
-  std::map<std::pair<const Value*, int>, int> syncArrays;
-  std::vector<int> nodeRepls; // Replication factor of each node
   int numSyncArrays = 0;
+  std::map<std::pair<const Value*, int>, int> syncArrays;
+  std::vector<int> syncArrayRepls;
+  
+  std::vector<int> nodeRepls; // Replication factor of each node
+  std::vector<Function*> nodeFuncs; // Function for each stage
+  std::vector<StructType*> nodeInputStructs; // Struct of inputs for each stage
+  int parStageRepl = -1;
+
+  // Track struct fields (other than those used for all stages) that each
+  // stages needs
+  std::map<int, std::vector<Value*>> stageInputs;
 
   const int numNodes = partition.getNodeCount();
   Module& M = *(loop->getHeader()->getModule());
@@ -1196,9 +1218,13 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
   for (int i = 0; i < numNodes; i++) {
     if (partition.getNode(i).doall) {
       nodeRepls.push_back(numThreads - (numNodes-1));
+      assert(parStageRepl == -1 && "Multiple parallel stages");
+      parStageRepl = numThreads - (numNodes-1);
     } else {
       nodeRepls.push_back(1);
     }
+    nodeFuncs.push_back(nullptr); // Allocating space
+    nodeInputStructs.push_back(nullptr);
   }
 
   // We need to traverse in reverse-topological order so that we assign
@@ -1246,7 +1272,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
   for (auto it = order.rbegin(), end = order.rend(); it != end; ++it) {
     int n = *it;
     DAGNode& node = partition.getNode(n);
-    errs() << "Code-generating for node " << n << "\n";
+    LLVM_DEBUG(dbgs() << "Code-generating for node " << n << "\n");
 
     std::vector<DAGEdge>& inEdges = incomingEdges[n];
 
@@ -1301,6 +1327,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
       structValues.push_back(val);
     }
 
+    stageInputs[n] = structValues;
+
     StructType* inputStructTy = StructType::create(M.getContext(),
          ArrayRef<Type*>(structFields),
          (loop->getName() + ".par.stage" + std::to_string(n) + ".args").str());
@@ -1313,6 +1341,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
       Function::Create(funcType,
         GlobalValue::LinkageTypes::ExternalLinkage, // unecessary?
         loop->getName() + ".par.stage" + std::to_string(n), M);
+    nodeFuncs[n] = func;
+    nodeInputStructs[n] = inputStructTy;
     // FIXME: I don't like this, but it avoids us running the PS-DSWP pass
     // on our pipeline stages. It may not be strictly necessary, but running
     // the pass again seems weird
@@ -1381,6 +1411,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
 
     std::vector<Instruction*> toRemap;
 
+    // Create a counter of the iterations (used in producing to parallel stages)
+    // We will actually place this instruction (and add the increment handler)
+    // after the rest of the code is in-place
+    PHINode* iterCounter = PHINode::Create(Type::getInt32Ty(M.getContext()), 2,
+                            "count.iters");
+
     // And then process all the instructions
     for (const BasicBlock* bb : loop->blocks()) {
       BasicBlock* newBB = BasicBlock::Create(M.getContext(), bb->getName(), func);
@@ -1398,8 +1434,13 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
             for (auto const& [toStage, edge] : outs) {
               int syncArrayNum = syncArrays[std::make_pair(&inst, toStage)];
               ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+              // For parallel stages, use the "iteration counter" we created
+              // and for sequential stages just use 0
+              Value* toInst = (nodeRepls[toStage] == 1
+                               ? (Value*) builder.getInt32(0)
+                               : (Value*) iterCounter);
               std::vector<Value*> produceArgs
-                = {arrays, syncArrayArg, instance, nullptr};
+                = {arrays, syncArrayArg, toInst, nullptr};
               switch (edge.dependence) {
                 case DAGEdge::Type::Register: {
                   // Just produce the value into the sync array
@@ -1445,6 +1486,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
             switch (type) {
               case DAGEdge::Type::Register: {
                 int syncArrayNum = numSyncArrays++;
+                syncArrayRepls.push_back(nodeRepls[n]);
                 syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                 ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
                 std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
@@ -1457,6 +1499,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
                 // For memory we consume just to signal that the memory
                 // operation depended on has occured
                 int syncArrayNum = numSyncArrays++;
+                syncArrayRepls.push_back(nodeRepls[n]);
                 syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                 ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
                 std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
@@ -1472,6 +1515,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
                 Value* cond = branch->getCondition();
                 if (vmap.find(cond) == vmap.end()) {
                   int syncArrayNum = numSyncArrays++;
+                  syncArrayRepls.push_back(nodeRepls[n]);
                   syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                   ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
                   std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
@@ -1496,6 +1540,25 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
         }
       }
     }
+
+    // Place the iteration counter now, at the head of the loop header
+    BasicBlock* newHeader = static_cast<BasicBlock*>(mapper.mapValue(*loop->getHeader()));
+    BasicBlock* newLatch = static_cast<BasicBlock*>(mapper.mapValue(*loop->getLoopLatch()));
+    iterCounter->insertBefore(newHeader->getFirstNonPHI());
+    BinaryOperator* inc = BinaryOperator::Create(Instruction::BinaryOps::Add,
+                            iterCounter,
+                            ConstantInt::get(Type::getInt32Ty(M.getContext()), 1),
+                            "iter.inc",
+                            newHeader->getFirstNonPHI());
+    BinaryOperator* mod = BinaryOperator::Create(Instruction::BinaryOps::URem,
+                            inc,
+                            ConstantInt::get(Type::getInt32Ty(M.getContext()),
+                              parStageRepl),
+                            "iter.mod", inc->getNextNonDebugInstruction());
+    iterCounter->addIncoming(
+        ConstantInt::get(Type::getInt32Ty(M.getContext()), 0),
+        entry);
+    iterCounter->addIncoming(mod, newLatch);
 
     // Add branch from entry to exit and loop header
     // To do this, consume a value from the synchronization array for the
@@ -1533,10 +1596,141 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     // instruction are in place to handle phi's)
     for (Instruction* inst : toRemap) mapper.remapInstruction(*inst);
 
-    errs() << "\n\n\n===============";
-    errs() << *func;
-    errs() << "===============\n\n\n";
+    LLVM_DEBUG(
+      dbgs() << "\n\n\n===============";
+      dbgs() << *func;
+      dbgs() << "===============\n\n\n");
   }
+
+  // Code-gen to launch and finish the pipeline, we do this at the end of the
+  // loop's pre-header, replacing the branch from that block into the
+  // header with a branch into a new block for this launch/finish, and deleting
+  // the loop body itself
+
+  BranchInst* loopLatchInst = dyn_cast<BranchInst>(loop->getLoopLatch()->getTerminator());
+  assert(loopLatchInst && "Loop latch terminator is not a branch");
+  bool exitsOn0 = loopLatchInst->getSuccessor(1) != loop->getHeader();
+
+  BasicBlock* newLoop = BasicBlock::Create(M.getContext(), "loop.par",
+                                            loop->getHeader()->getParent());
+  IRBuilder builder(newLoop);
+  assert(loop->getLoopPreheader() && "Loop doesn't have a pre-header");
+  assert(loop->getExitBlock() && "Loop doesn't have unique exit block");
+  BranchInst* branch = dyn_cast<BranchInst>(loop->getLoopPreheader()->getTerminator());
+  assert(branch && branch->isUnconditional()
+         && "Loop pre-header is not unconditional branch");
+  branch->setSuccessor(0, newLoop);
+  // Add branch to the exit block, and set the builder to insert before it
+  builder.SetInsertPoint(BranchInst::Create(loop->getExitBlock(), newLoop));
+  // TODO: Handle live outs
+  assert(loop->getExitBlock()->phis().empty() && "Live-outs not handled");
+  
+  // Now we delete the loop
+  for (BasicBlock* bb : loop->blocks()) { bb->eraseFromParent(); }
+
+  // To launch the pipeline:
+  // (1) Create the synchronization arrays
+  std::vector<Value*> createArgs;
+  createArgs.push_back(builder.getInt32(numSyncArrays));
+  for (int repl : syncArrayRepls) {
+    createArgs.push_back(builder.getInt32(repl));
+  }
+  CallInst* syncArray = 
+    builder.CreateCall(psdswp.createSyncArrays, ArrayRef<Value*>(createArgs),
+                       "sync.array");
+
+  // (2) Create structs for each stage instance and launch the stage instance
+  std::vector<std::vector<CallInst*>> threadIds;
+  for (int n = 0; n < numNodes; n++) {
+    threadIds.push_back(std::vector<CallInst*>{});
+
+    const int instances = nodeRepls[n];
+    Function* nodeFunc = nodeFuncs[n];
+    StructType* nodeInput = nodeInputStructs[n];
+    for (int inst = 0; inst < instances; inst++) {
+      AllocaInst* input = builder.CreateAlloca(nodeInput);
+      
+      // Add instance number
+      std::vector<Value*> gepIndices = {builder.getInt32(0), builder.getInt32(0)};
+      builder.CreateStore(
+        builder.getInt32(inst),
+        builder.CreateGEP(nodeInput, input, ArrayRef<Value*>(gepIndices)));
+      
+      // Add synchronization arrays
+      gepIndices[1] = builder.getInt32(1);
+      builder.CreateStore(syncArray,
+        builder.CreateGEP(nodeInput, input, ArrayRef<Value*>(gepIndices)));
+      
+      // Add other arguments
+      int i = 2;
+      for (Value* arg : stageInputs[n]) {
+        gepIndices[1] = builder.getInt32(i);
+        builder.CreateStore(arg,
+          builder.CreateGEP(nodeInput, input, ArrayRef<Value*>(gepIndices)));
+        i++;
+      }
+
+      // Now, we launch the stage instance
+      std::vector<Value*> launchArgs = {
+        builder.CreateBitCast(input, Type::getInt8PtrTy(M.getContext())),
+        nodeFunc
+      };
+      threadIds[n].push_back(
+        builder.CreateCall(psdswp.launchStage, ArrayRef<Value*>(launchArgs)));
+    }
+  }
+
+  // Now, we wait for it to complete by
+  // (3) Wait for the source node(s) to complete
+  for (int n = 0; n < numNodes; n++) {
+    if (incomingEdges[n].empty()) { // Source node
+      const int instances = nodeRepls[n];
+      for (int inst = 0; inst < instances; inst++) {
+        builder.CreateCall(psdswp.waitForStage,
+                           ArrayRef<Value*>(threadIds[n][inst]));
+      }
+    }
+  }
+
+  // (4) Send signals for every instance of every stage on the loop condition
+  // to exit the loop
+  std::vector<Value*> produceArgs = {syncArray,
+                                     builder.getInt32(0), // placeholder
+                                     builder.getInt32(0), // placeholder
+                                     builder.getInt64(exitsOn0 ? 0 : 1)};
+  for (int n = 0; n < numNodes; n++) {
+    errs() << "LoopLatchInst: " << loopLatchInst << "\n";
+    auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
+    if (f != syncArrays.end()) {
+      int syncArray = f->second;
+      int repl = nodeRepls[n];
+      for (int inst = 0; inst < repl; inst++) {
+        produceArgs[1] = builder.getInt32(syncArray);
+        produceArgs[2] = builder.getInt32(inst);
+        builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+      }
+    }
+  }
+
+  // (5) Wait for all other instances to finish
+  for (int n = 0; n < numNodes; n++) {
+    if (!incomingEdges[n].empty()) { // Non-source node
+      const int instances = nodeRepls[n];
+      for (int inst = 0; inst < instances; inst++) {
+        builder.CreateCall(psdswp.waitForStage,
+                           ArrayRef<Value*>(threadIds[n][inst]));
+      }
+    }
+  }
+  
+  // (6) Free the synchronization arrays
+  std::vector<Value*> freeArgs;
+  freeArgs.push_back(syncArray);
+  freeArgs.push_back(builder.getInt32(numSyncArrays));
+  for (int repl : syncArrayRepls) {
+    createArgs.push_back(builder.getInt32(repl));
+  }
+  builder.CreateCall(psdswp.freeSyncArrays, ArrayRef<Value*>(freeArgs));
 
   return true;
 }
