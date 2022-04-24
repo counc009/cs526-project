@@ -25,8 +25,11 @@ array/%.opt.ll: array/%.ll
 array/%.par.ll: array/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
-array/%.out: array/%.par.ll test_array.ll
-	$(CLANG) -O1 $^ -o $@
+array/%.ref: array/%.opt.ll test_array.ll
+	$(CLANG) -O3 $^ -o $@
+
+array/%.exec: array/%.par.ll test_array.ll
+	$(CLANG) -O3 $^ -o $@
 
 linked_list/%.opt.ll: linked_list/%.ll
 	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
@@ -34,8 +37,11 @@ linked_list/%.opt.ll: linked_list/%.ll
 linked_list/%.par.ll: linked_list/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node $^ -S -o $@
 
-linked_list/%.out: linked_list/%.par.ll test_list.ll
-	$(CLANG) -O1 $^ -o $@
+linked_list/%.ref: linked_list/%.opt.ll test_list.ll
+	$(CLANG) -O3 $^ -o $@
+
+linked_list/%.exec: linked_list/%.par.ll test_list.ll
+	$(CLANG) -O3 $^ -o $@
 
 clean:
 	rm -rf *.ll *.out */*.ll */*.out

@@ -1,5 +1,3 @@
-#include "psdswp.h"
-
 typedef int elem_t;
 typedef unsigned int len_t;
 

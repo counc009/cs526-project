@@ -17,6 +17,10 @@ void freeSyncArrays(void* syncArrays, int numArrays, ...);
 void produce(void* syncArrays, int toArray, int toRepl, int64_t value);
 // LLVM type: i64 (i8*, i32, i32)
 int64_t consume(void* syncArrays, int fromArray, int fromRepl);
+// LLVM type: i64 (i8*, i8*(i8*))
+pthread_t launchStage(void* argument, void*(*func)(void*));
+// LLVM type: void (i64)
+void waitForStage(pthread_t thread);
 
 // Providing the function definitions in the header means LLVM won't just
 // delete the unused declarations
@@ -72,8 +76,11 @@ void freeSyncArrays(void* syncArrays, int numArrays, ...) __attribute__((optnone
     for (int j = 0; j < instances; j++) {
       pthread_mutex_destroy(&(pipelines[i][j].lock));
       pthread_cond_destroy(&(pipelines[i][j].empty));
-      // We don't free any data from the list, because it should all be
-      // consumed already
+      // We may free one element as this off-by-one occurs with the loop
+      // condition
+      if (pipelines[i][j].header.next != &(pipelines[i][j].footer)) {
+        free(pipelines[i][j].header.next);
+      }
     }
     free(pipelines[i]);
   }
@@ -100,7 +107,7 @@ void produce(void* syncArrays, int toArray, int toRepl, int64_t value) __attribu
 
 int64_t consume(void* syncArrays, int fromArray, int fromRepl) __attribute__((optnone)) {
   struct syncArray** pipelines = (struct syncArray**) syncArrays;
-  struct syncArray* syncArray = &(pipelines[fromArray][fromRepl]);
+  volatile struct syncArray* syncArray = &(pipelines[fromArray][fromRepl]);
 
   pthread_mutex_lock(&syncArray->lock);
   while (syncArray->header.next == &(syncArray->footer)) {
@@ -110,11 +117,25 @@ int64_t consume(void* syncArrays, int fromArray, int fromRepl) __attribute__((op
   int64_t value = syncArray->header.next->val;
   struct syncArrayElem* elem = syncArray->header.next;
   syncArray->header.next = elem->next;
-  elem->next = elem->prev;
+  elem->next->prev = elem->prev;
   free(elem);
 
   pthread_mutex_unlock(&syncArray->lock);
   return value;
+}
+
+pthread_t launchStage(void* argument, void*(*func)(void*)) __attribute__((optnone)) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, func, argument)) {
+    exit(1);
+  }
+  return thread;
+}
+
+void waitForStage(pthread_t thread) __attribute__((optnone)) {
+  if (pthread_join(thread, NULL)) {
+    exit(1);
+  }
 }
 
 #endif // PAR_SUPPORT_H_

@@ -1416,6 +1416,15 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     // after the rest of the code is in-place
     PHINode* iterCounter = PHINode::Create(Type::getInt32Ty(M.getContext()), 2,
                             "count.iters");
+    BinaryOperator* iterInc = BinaryOperator::Create(Instruction::BinaryOps::Add,
+                            iterCounter,
+                            ConstantInt::get(Type::getInt32Ty(M.getContext()), 1),
+                            "iter.inc");
+    BinaryOperator* iterMod = BinaryOperator::Create(Instruction::BinaryOps::URem,
+                            iterInc,
+                            ConstantInt::get(Type::getInt32Ty(M.getContext()),
+                              parStageRepl),
+                            "iter.mod");
 
     // And then process all the instructions
     for (const BasicBlock* bb : loop->blocks()) {
@@ -1453,6 +1462,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
                   builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
                 }; break;
                 case DAGEdge::Type::Control: {
+                  // If this is the loop latch, produce for the next iteration
+                  if (&inst == loop->getLoopLatch()->getTerminator())
+                    produceArgs[2] = iterMod;
                   // Produce the condition into the sync array
                   BranchInst* branch = dyn_cast<BranchInst>(copy);
                   assert(branch && branch->isConditional()
@@ -1545,20 +1557,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     BasicBlock* newHeader = static_cast<BasicBlock*>(mapper.mapValue(*loop->getHeader()));
     BasicBlock* newLatch = static_cast<BasicBlock*>(mapper.mapValue(*loop->getLoopLatch()));
     iterCounter->insertBefore(newHeader->getFirstNonPHI());
-    BinaryOperator* inc = BinaryOperator::Create(Instruction::BinaryOps::Add,
-                            iterCounter,
-                            ConstantInt::get(Type::getInt32Ty(M.getContext()), 1),
-                            "iter.inc",
-                            newHeader->getFirstNonPHI());
-    BinaryOperator* mod = BinaryOperator::Create(Instruction::BinaryOps::URem,
-                            inc,
-                            ConstantInt::get(Type::getInt32Ty(M.getContext()),
-                              parStageRepl),
-                            "iter.mod", inc->getNextNonDebugInstruction());
+    iterMod->insertBefore(newHeader->getFirstNonPHI());
+    iterInc->insertBefore(iterMod);
     iterCounter->addIncoming(
         ConstantInt::get(Type::getInt32Ty(M.getContext()), 0),
         entry);
-    iterCounter->addIncoming(mod, newLatch);
+    iterCounter->addIncoming(iterMod, newLatch);
 
     // Add branch from entry to exit and loop header
     // To do this, consume a value from the synchronization array for the
@@ -1680,8 +1684,25 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     }
   }
 
+  // (3) Signaling the first iteration of any stage which needs it (for parallel
+  // stages we only signal the first instance)
+  {
+    std::vector<Value*> produceArgs = {syncArray,
+                                       builder.getInt32(0), // placeholder
+                                       builder.getInt32(0),
+                                       builder.getInt64(exitsOn0 ? 1 : 0)};
+    for (int n = 0; n < numNodes; n++) {
+      auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
+      if (f != syncArrays.end()) {
+        int syncArray = f->second;
+        produceArgs[1] = builder.getInt32(syncArray);
+        builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+      }
+    }
+  }
+
   // Now, we wait for it to complete by
-  // (3) Wait for the source node(s) to complete
+  // (4) Wait for the source node(s) to complete
   for (int n = 0; n < numNodes; n++) {
     if (incomingEdges[n].empty()) { // Source node
       const int instances = nodeRepls[n];
@@ -1692,14 +1713,13 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     }
   }
 
-  // (4) Send signals for every instance of every stage on the loop condition
+  // (5) Send signals for every instance of every stage on the loop condition
   // to exit the loop
   std::vector<Value*> produceArgs = {syncArray,
                                      builder.getInt32(0), // placeholder
                                      builder.getInt32(0), // placeholder
                                      builder.getInt64(exitsOn0 ? 0 : 1)};
   for (int n = 0; n < numNodes; n++) {
-    errs() << "LoopLatchInst: " << loopLatchInst << "\n";
     auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
     if (f != syncArrays.end()) {
       int syncArray = f->second;
@@ -1712,7 +1732,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     }
   }
 
-  // (5) Wait for all other instances to finish
+  // (6) Wait for all other instances to finish
   for (int n = 0; n < numNodes; n++) {
     if (!incomingEdges[n].empty()) { // Non-source node
       const int instances = nodeRepls[n];
@@ -1723,12 +1743,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
     }
   }
   
-  // (6) Free the synchronization arrays
+  // (7) Free the synchronization arrays
   std::vector<Value*> freeArgs;
   freeArgs.push_back(syncArray);
   freeArgs.push_back(builder.getInt32(numSyncArrays));
   for (int repl : syncArrayRepls) {
-    createArgs.push_back(builder.getInt32(repl));
+    freeArgs.push_back(builder.getInt32(repl));
   }
   builder.CreateCall(psdswp.freeSyncArrays, ArrayRef<Value*>(freeArgs));
 
