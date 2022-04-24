@@ -15,7 +15,7 @@ void freeSyncArrays(void* syncArrays, int numArrays, ...);
 // Currently, only supports passing scalars values up to 64-bits, they must be
 // converted into an i64 by bit-extension and bitcasting (as needed)
 void produce(void* syncArrays, int toArray, int toRepl, int64_t value);
-// LLVM type: i64 (i8*, i32)
+// LLVM type: i64 (i8*, i32, i32)
 int64_t consume(void* syncArrays, int fromArray, int fromRepl);
 
 // Providing the function definitions in the header means LLVM won't just

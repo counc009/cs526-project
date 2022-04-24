@@ -6,6 +6,7 @@
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GraphWriter.h"
@@ -34,8 +35,12 @@ namespace {
     static char ID; // Pass identification
     PS_DSWP() : FunctionPass(ID) {}
 
+    FunctionCallee createSyncArrays, freeSyncArrays, produce, consume;
+
     // Entry point for the overall scalar-replacement pass
     bool runOnFunction(Function &F);
+
+    void initializeParFuncs(Module& M);
 
     // getAnalysisUsage - List passes required by this pass
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
@@ -249,7 +254,35 @@ static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, st
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
 static DataStructureAnalysis analyzeDataStructures(Loop* loop);
-static bool performParallelization(DAG partition, Loop* loop);
+static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop);
+
+void PS_DSWP::initializeParFuncs(Module& M) {
+  auto& context = M.getContext();
+
+  Type* tyI8Ptr = Type::getInt8PtrTy(context);
+  Type* tyI32 = Type::getInt32Ty(context);
+  Type* tyI64 = Type::getInt64Ty(context);
+  Type* tyVoid = Type::getVoidTy(context);
+
+  FunctionType* createSyncArraysTy
+      = FunctionType::get(tyI8Ptr, ArrayRef<Type*>(tyI32), true);
+  createSyncArrays = M.getOrInsertFunction("createSyncArrays", createSyncArraysTy);
+
+  std::vector<Type*> freeArgs = {tyI8Ptr, tyI32};
+  FunctionType* freeSyncArraysTy
+      = FunctionType::get(tyVoid, ArrayRef<Type*>(freeArgs), true);
+  freeSyncArrays = M.getOrInsertFunction("freeSyncArrays", freeSyncArraysTy);
+
+  std::vector<Type*> produceArgs = {tyI8Ptr, tyI32, tyI32, tyI64};
+  FunctionType* produceTy
+      = FunctionType::get(tyVoid, ArrayRef<Type*>(produceArgs), false);
+  produce = M.getOrInsertFunction("produce", produceTy);
+  
+  std::vector<Type*> consumeArgs = {tyI8Ptr, tyI32, tyI32};
+  FunctionType* consumeTy
+      = FunctionType::get(tyI64, ArrayRef<Type*>(consumeArgs), false);
+  consume = M.getOrInsertFunction("consume", consumeTy);
+}
 
 bool PS_DSWP::runOnFunction(Function &F) {
   if (F.hasFnAttribute(Attribute::OptimizeNone)) {
@@ -264,6 +297,8 @@ bool PS_DSWP::runOnFunction(Function &F) {
               "two threads\n";
     return false;
   }
+
+  initializeParFuncs(*F.getParent());
 
   bool modified = false; // Tracks whether we modified the function
 
@@ -294,7 +329,7 @@ bool PS_DSWP::runOnFunction(Function &F) {
     // TODO: Should probably have another performance estimate here to predict
     // whether this will actually perform result in a speed-up
 
-    modified |= performParallelization(partitioned, loop);
+    modified |= performParallelization(*this, partitioned, loop);
   }
 
   return modified;
@@ -1102,11 +1137,33 @@ static DataStructureAnalysis analyzeDataStructures(Loop* loop) {
   return result;
 }
 
-static bool performParallelization(DAG partition, Loop* loop) {
+static Value* truncateAndCast(IRBuilder<>& builder, Module& M,
+                              Instruction* inst, Type* dstType,
+                              Twine name) {
+  assert(inst->getType() == Type::getInt64Ty(M.getContext()));
+  if (inst->getType() == dstType) return inst;
+  if (dstType->isPointerTy()) {
+    return builder.CreateIntToPtr(inst, dstType, name);
+  } else {
+    if (dstType->isIntegerTy()) {
+      return builder.CreateTrunc(inst, dstType, name);
+    } else if (dstType == Type::getDoubleTy(M.getContext())) {
+      return builder.CreateBitCast(inst, dstType, name);
+    } else if (dstType == Type::getFloatTy(M.getContext())) {
+      return builder.CreateBitCast(
+              builder.CreateTrunc(inst, Type::getInt32Ty(M.getContext())),
+              dstType, name);
+    } else {
+      assert(false && "truncateAndCast() encountered unknown type");
+    }
+  }
+}
+
+static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
   // This map tracks the synchronization arrays and which values they represent
   // and in what stage (the value and stage are the key, the value is the number
   // of the synchronization array)
-  std::map<std::pair<Value*, int>, int> syncArrays;
+  std::map<std::pair<const Value*, int>, int> syncArrays;
   std::vector<int> nodeRepls; // Replication factor of each node
   int numSyncArrays = 0;
 
@@ -1171,29 +1228,13 @@ static bool performParallelization(DAG partition, Loop* loop) {
 
     std::vector<DAGEdge>& inEdges = incomingEdges[n];
 
-    // Classify the edges for handling (this also deduplicates dependence on 
-    // the same instruction from multiple instructions in this node)
-    std::map<Instruction*, std::vector<Instruction*>> regDependences;
-    std::map<Instruction*, std::vector<Instruction*>> memDependences;
-    std::map<Instruction*, std::vector<Instruction*>> controlDependences;
-    std::map<Instruction*, std::vector<Instruction*>> phiDependences;
+    // Place instructions in this part into a set for easier lookup
+    std::set<const Instruction*> stageInsts;
+    for (Instruction* inst : node.insts) stageInsts.insert(inst);
 
-    for (DAGEdge& edge : inEdges) {
-      switch (edge.dependence) {
-        case DAGEdge::Type::Register: {
-            regDependences[edge.src].push_back(edge.dst);
-          }; break;
-        case DAGEdge::Type::Memory: {
-            memDependences[edge.src].push_back(edge.dst);
-          }; break;
-        case DAGEdge::Type::Control: {
-            controlDependences[edge.src].push_back(edge.dst);
-          }; break;
-        case DAGEdge::Type::PHI: {
-            phiDependences[edge.src].push_back(edge.dst);
-          }; break;
-      }
-    }
+    // Sort incoming dependences by the source instruction
+    std::map<const Instruction*, std::vector<DAGEdge>> dependences;
+    for (DAGEdge& edge : inEdges) dependences[edge.src].push_back(edge);
 
     // Find all values from outside the loop-nest that are needed in this
     // partition. These become arguments to the node function
@@ -1235,8 +1276,19 @@ static bool performParallelization(DAG partition, Loop* loop) {
       Function::Create(funcType,
         GlobalValue::LinkageTypes::ExternalLinkage, // unecessary?
         loop->getName() + ".par.stage" + std::to_string(n), M);
-    
+    // FIXME: I don't like this, but it avoids us running the PS-DSWP pass
+    // on our pipeline stages. It may not be strictly necessary, but running
+    // the pass again seems weird
+    func->addFnAttr(Attribute::OptimizeNone);
+    func->addFnAttr(Attribute::NoInline);
+
     BasicBlock* entry = BasicBlock::Create(M.getContext(), "entry", func);
+    BasicBlock* exit = BasicBlock::Create(M.getContext(), "exit", func);
+
+    // Return NULL
+    ReturnInst::Create(M.getContext(), ConstantPointerNull::get(voidPtr),
+      exit);
+
     // Cast argument to struct type
     CastInst* inputPtr = BitCastInst::CreatePointerCast(func->getArg(0),
                             inputStructTy->getPointerTo(), "stage.arg",
@@ -1244,9 +1296,10 @@ static bool performParallelization(DAG partition, Loop* loop) {
     
     // Load the values out of the struct
     ValueToValueMapTy vmap;
+    ValueMapper mapper(vmap);
     int i = 2;
     Type* tyI32 = Type::getInt32Ty(M.getContext());
-    
+
     std::vector<Value*> gepIdx;
     gepIdx.push_back(ConstantInt::get(tyI32, 0));
     gepIdx.push_back(ConstantInt::get(tyI32, 0));
@@ -1275,11 +1328,136 @@ static bool performParallelization(DAG partition, Loop* loop) {
                                   ArrayRef<Value*>(gepIdx), "", entry),
         "par.arrays", entry);
 
-    // TODO: Actual code-gen
+    // The actual code-gen
+    // Strategy: copy all instructions from the loop into this new function,
+    // but removing or replacing the instructions not in this part of the
+    // partition. We remove instructions have no instruction in this part has
+    // a dependence on, and replace instructions that we do have dependences on
+    // with consume() operations
 
-    // Return NULL
-    ReturnInst::Create(M.getContext(), ConstantPointerNull::get(voidPtr),
-      entry);
+    // Start by creating basic blocks for each block of the loop (do this all
+    // at once so we can easily construct branches)
+    for (BasicBlock* bb : loop->blocks()) {
+      vmap[bb] = BasicBlock::Create(M.getContext(), bb->getName(), func);
+    }
+   
+    // Register the function exit block to be the exit block of the loop
+    // and the entry block of the function to be the loop's entry
+    assert(loop->getExitBlock() && "Loop doesn't have unique exit block");
+    assert(loop->getLoopPredecessor() && "Loop doesn't have unique entry");
+    vmap[loop->getExitBlock()] = exit;
+    vmap[loop->getLoopPredecessor()] = entry;
+
+    std::vector<Instruction*> toRemap;
+
+    // And then process all the instructions
+    for (const BasicBlock* bb : loop->blocks()) {
+      Value* vmapRes = vmap[bb];
+      BasicBlock* newBB = static_cast<BasicBlock*>(vmapRes);
+      IRBuilder builder(newBB);
+      for (const Instruction& inst : *bb) {
+        if (stageInsts.find(&inst) != stageInsts.end()) {
+          Instruction* copy = inst.clone();
+          vmap[&inst] = copy;
+          toRemap.push_back(copy);
+          builder.Insert(copy);
+          // TODO: Insert appropriate produce() calls
+        } else {
+          auto f = dependences.find(&inst);
+          if (f == dependences.end()) {
+            // Ignore the instruction (not sure this is actually correct for
+            // terminators, but TBD...)
+          } else {
+            std::vector<DAGEdge>& edges = f->second;
+            DAGEdge::Type type = edges[0].dependence;
+            for (DAGEdge& e : edges) {
+              assert(e.dependence == type && "Dependence has multiple types");
+            }
+            switch (type) {
+              case DAGEdge::Type::Register: {
+                int syncArrayNum = numSyncArrays++;
+                syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
+                ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+                std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                CallInst* consumeInst
+                  = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+                vmap[&inst] = truncateAndCast(builder, M, consumeInst,
+                                              inst.getType(), inst.getName());
+              }; break;
+              case DAGEdge::Type::Memory: {
+                // For memory we consume just to signal that the memory
+                // operation depended on has occured
+                int syncArrayNum = numSyncArrays++;
+                syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
+                ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+                std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                CallInst* consumeInst
+                  = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+              }; break;
+              case DAGEdge::Type::Control: {
+                // For control dependences, this instruction must be a
+                // conditional branch and we consume the condition to use
+                const BranchInst* branch = dyn_cast<BranchInst>(&inst);
+                assert(branch && branch->isConditional()
+                       && "Control dependence from inst not a conditional branch");
+                Value* cond = branch->getCondition();
+                if (vmap.find(cond) == vmap.end()) {
+                  int syncArrayNum = numSyncArrays++;
+                  syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
+                  ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                  CallInst* consumeInst
+                    = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+                  Value* newCond = truncateAndCast(builder, M, consumeInst,
+                                                Type::getInt1Ty(M.getContext()),
+                                                "");
+                  vmap[cond] = newCond;
+                }
+                
+                Instruction* copy = inst.clone();
+                toRemap.push_back(copy);
+                builder.Insert(copy);
+              }; break;
+              case DAGEdge::Type::PHI: {
+                assert(false && "TODO");
+                // TODO
+              }; break;
+            }
+          }
+        }
+      }
+    }
+
+    // Add branch from entry to exit and loop header
+    // To do this, consume a value from the synchronization array for the
+    // loop's latch instruction
+    Instruction* latch = loop->getLoopLatch()->getTerminator();
+    int syncArrayNum = syncArrays[std::make_pair(latch, n)];
+    IRBuilder builder(entry);
+    ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+    std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+    CallInst* consumeInst
+        = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+    Value* cond = truncateAndCast(builder, M, consumeInst,
+                                  Type::getInt1Ty(M.getContext()), "");
+    BranchInst* branch = dyn_cast<BranchInst>(latch->clone());
+    assert(branch && "Loop latch terminator not a branch instruction");
+    assert(branch->isConditional() && "Loop latch terminator is not conditional");
+    const int numSuccessors = branch->getNumSuccessors();
+    for (unsigned i = 0; i < numSuccessors; i++) {
+      branch->setSuccessor(i,
+        static_cast<BasicBlock*>(mapper.mapValue(*branch->getSuccessor(i))));
+    }
+    branch->setCondition(cond);
+    builder.Insert(branch);
+
+    // Remap all instructions that need it (we have to do this after all
+    // instruction are in place to handle phi's)
+    for (Instruction* inst : toRemap) mapper.remapInstruction(*inst);
+
+    errs() << "\n\n\n===============";
+    errs() << *func;
+    errs() << "===============\n\n\n";
   }
 
   return true;
