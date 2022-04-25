@@ -1431,12 +1431,26 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
       BasicBlock* newBB = BasicBlock::Create(M.getContext(), bb->getName(), func);
       vmap[bb] = newBB;
       IRBuilder builder(newBB);
+      // Track the most recent phi's position so we can insert the next phi directly
+      // after it (not after any produce calls it may have generated, since LLVM
+      // doesn't allow that)
+      PHINode* lastPHI = nullptr;
       for (const Instruction& inst : *bb) {
         if (stageInsts.find(&inst) != stageInsts.end()) {
           Instruction* copy = inst.clone();
           vmap[&inst] = copy;
           toRemap.push_back(copy);
-          builder.Insert(copy);
+
+          // Insert the node, just use builder for non-phi nodes and insert it
+          // after the latest phi for phi's
+          if (PHINode* phi = dyn_cast<PHINode>(copy)) {
+            if (lastPHI) copy->insertAfter(lastPHI);
+            else builder.Insert(copy);
+            lastPHI = phi;
+          } else {
+            builder.Insert(copy);
+          }
+
           auto f = outEdges.find(&inst);
           if (f != outEdges.end()) {
             std::map<int, DAGEdge> outs = f->second;
