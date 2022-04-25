@@ -107,7 +107,7 @@ void produce(void* syncArrays, int toArray, int toRepl, int64_t value) __attribu
 
 int64_t consume(void* syncArrays, int fromArray, int fromRepl) __attribute__((optnone)) {
   struct syncArray** pipelines = (struct syncArray**) syncArrays;
-  volatile struct syncArray* syncArray = &(pipelines[fromArray][fromRepl]);
+  struct syncArray* syncArray = &(pipelines[fromArray][fromRepl]);
 
   pthread_mutex_lock(&syncArray->lock);
   while (syncArray->header.next == &(syncArray->footer)) {
