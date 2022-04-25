@@ -255,7 +255,8 @@ static void strongconnect(int, int*, int* ,std::stack<int>&,bool*, PDG, DAG&, st
 static DAG connectEdges(PDG, DAG,  std::map<int, std::vector<int>>&,  std::map<int, int>&);
 static DAG threadPartitioning(DAG dag);
 static DataStructureAnalysis analyzeDataStructures(Loop* loop);
-static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop);
+static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
+                                   DominatorTree& DT);
 
 void PS_DSWP::initializeParFuncs(Module& M) {
   auto& context = M.getContext();
@@ -342,7 +343,7 @@ bool PS_DSWP::runOnFunction(Function &F) {
     // TODO: Should probably have another performance estimate here to predict
     // whether this will actually perform result in a speed-up
 
-    modified |= performParallelization(*this, partitioned, loop);
+    modified |= performParallelization(*this, partitioned, loop, DT);
   }
 
   return modified;
@@ -1194,7 +1195,8 @@ static Value* truncateAndCast(IRBuilder<>& builder, Module& M,
   }
 }
 
-static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
+static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
+                                   DominatorTree& DT) {
   // This map tracks the synchronization arrays and which values they represent
   // and in what stage (the value and stage are the key, the value is the number
   // of the synchronization array)
@@ -1501,8 +1503,32 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
         } else {
           auto f = dependences.find(&inst);
           if (f == dependences.end()) {
-            // Ignore the instruction (not sure this is actually correct for
-            // terminators, but TBD...)
+            // Ignore the instruction unless it's a terminator
+            if (inst.isTerminator()) {
+              const BranchInst* branch = dyn_cast<BranchInst>(&inst);
+              assert(branch && "Encountered non-branch terminator in loop");
+
+              // For unconditional branches, just emit them and remap them
+              if (branch->isUnconditional()) {
+                Instruction* copy = inst.clone();
+                builder.Insert(copy);
+                toRemap.push_back(copy);
+              } else {
+                // For conditional branches pick one direction that does not
+                // traverse a back-edge
+                assert(branch->getNumSuccessors() == 2
+                      && "Conditional branch with more than 2 successors");
+                BasicBlock* succ1 = branch->getSuccessor(0);
+                BasicBlock* succ2 = branch->getSuccessor(1);
+                if (succ1 != bb && !DT.dominates(succ1, bb)) {
+                  toRemap.push_back(builder.CreateBr(succ1));
+                } else {
+                  assert(succ2 != bb && !DT.dominates(succ2, bb)
+                    && "Unhandled: branch containing two back-edges");
+                  toRemap.push_back(builder.CreateBr(succ2));
+                }
+              }
+            }
           } else {
             std::vector<DAGEdge>& edges = f->second;
             DAGEdge::Type type = edges[0].dependence;
@@ -1643,8 +1669,14 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop) {
   // TODO: Handle live outs
   assert(loop->getExitBlock()->phis().empty() && "Live-outs not handled");
   
-  // Now we delete the loop
-  for (BasicBlock* bb : loop->blocks()) { bb->eraseFromParent(); }
+  // Now we delete the loop (first go through and drop references to avoid
+  // dependence issues as we go through and delete)
+  for (BasicBlock* bb : loop->blocks()) {
+    bb->dropAllReferences();
+  }
+  for (BasicBlock* bb : loop->blocks()) {
+    bb->eraseFromParent();
+  }
 
   // To launch the pipeline:
   // (1) Create the synchronization arrays
