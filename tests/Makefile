@@ -46,5 +46,8 @@ linked_list/%.exec: linked_list/%.par.ll test_list.ll
 clean:
 	rm -rf *.ll *.exec *.ref */*.ll */*.exec */*.ref
 
-.PHONY: clean
+# Build the executables that are currently working
+working: array/increment.ref array/increment.exec array/incdec.ref array/incdec.exec array/squarenons.ref array/squarenons.exec linked_list/increment.ref linked_list/increment.exec linked_list/incdec.ref linked_list/incdec.exec linked_list/squarenons.ref linked_list/squarenons.exec
+
+.PHONY: clean working
 .PRECIOUS: %.ll
