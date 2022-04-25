@@ -33,6 +33,8 @@ namespace {
 
   struct PS_DSWP : public FunctionPass {
     static char ID; // Pass identification
+    std::set<Function*> stageFuncs; // Track functions for stages to skip
+
     PS_DSWP() : FunctionPass(ID) {}
 
     FunctionCallee createSyncArrays, freeSyncArrays, produce, consume,
@@ -299,6 +301,11 @@ void PS_DSWP::initializeParFuncs(Module& M) {
 }
 
 bool PS_DSWP::runOnFunction(Function &F) {
+  if (stageFuncs.find(&F) != stageFuncs.end()) {
+    LLVM_DEBUG(dbgs() << "[psdswp] Skipping function " << F.getName()
+                      << " since it is a stage of a parallelized loop\n");
+    return false;
+  }
   if (F.hasFnAttribute(Attribute::OptimizeNone)) {
     LLVM_DEBUG(dbgs() << "[psdswp] Skipping function " << F.getName()
                       << " (marked optnone)\n");
@@ -1345,11 +1352,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
         loop->getName() + ".par.stage" + std::to_string(n), M);
     nodeFuncs[n] = func;
     nodeInputStructs[n] = inputStructTy;
-    // FIXME: I don't like this, but it avoids us running the PS-DSWP pass
-    // on our pipeline stages. It may not be strictly necessary, but running
-    // the pass again seems weird
-    func->addFnAttr(Attribute::OptimizeNone);
-    func->addFnAttr(Attribute::NoInline);
+    psdswp.stageFuncs.insert(func);
 
     BasicBlock* entry = BasicBlock::Create(M.getContext(), "entry", func);
     BasicBlock* exit = BasicBlock::Create(M.getContext(), "exit", func);
