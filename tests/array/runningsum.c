@@ -1,5 +1,4 @@
 #include "../array.h"
-#include "../psdswp.h"
 
 void operation(elem_t* array, len_t length) {
   elem_t sum = 0;

@@ -1,5 +1,4 @@
 #include "../list.h"
-#include "../psdswp.h"
 
 void operation(list_t list) {
   elem_t sum = 0;

@@ -6,13 +6,15 @@ NUM_THREADS = 8
 SOURCES = $(wildcard array/*.c linked_list/*.c)
 OPTS = $(addsuffix .opt.ll, $(basename $(SOURCES)))
 PARS = $(addsuffix .par.ll, $(basename $(SOURCES)))
-EXECS = $(addsuffix .out, $(basename $(SOURCES)))
+EXECS = $(addsuffix .exec, $(basename $(SOURCES)))
+REFS = $(addsuffix .ref, $(basename $(SOURCES)))
 
 PRE_PSDSWP_FLAGS = -sccp -simplifycfg -loop-simplify
 PSDSWP_FLAGS = -enable-new-pm=0 -load ../build/pass/libPS-DSWP.so -tbaa -psdswp -debug
 
-all: exec
+all: exec refs
 exec: $(EXECS)
+refs: $(REFS)
 opt: $(OPTS)
 par: $(PARS)
 
@@ -25,10 +27,10 @@ array/%.opt.ll: array/%.ll
 array/%.par.ll: array/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
-array/%.ref: array/%.opt.ll test_array.ll
+array/%.ref: array/%.opt.ll test_array.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
-array/%.exec: array/%.par.ll test_array.ll
+array/%.exec: array/%.par.ll test_array.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
 linked_list/%.opt.ll: linked_list/%.ll
@@ -37,10 +39,10 @@ linked_list/%.opt.ll: linked_list/%.ll
 linked_list/%.par.ll: linked_list/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node $^ -S -o $@
 
-linked_list/%.ref: linked_list/%.opt.ll test_list.ll
+linked_list/%.ref: linked_list/%.opt.ll test_list.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
-linked_list/%.exec: linked_list/%.par.ll test_list.ll
+linked_list/%.exec: linked_list/%.par.ll test_list.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
 clean:
