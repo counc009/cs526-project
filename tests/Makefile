@@ -44,7 +44,7 @@ linked_list/%.exec: linked_list/%.par.ll test_list.ll
 	$(CLANG) -O3 $^ -o $@
 
 clean:
-	rm -rf *.ll *.out */*.ll */*.out
+	rm -rf *.ll *.exec *.ref */*.ll */*.exec */*.ref
 
 .PHONY: clean
 .PRECIOUS: %.ll
