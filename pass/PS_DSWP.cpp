@@ -1482,7 +1482,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 }; break;
                 case DAGEdge::Type::Control: {
                   // If this is the loop latch, produce for the next iteration
-                  if (&inst == loop->getLoopLatch()->getTerminator())
+                  if (&inst == loop->getLoopLatch()->getTerminator()
+                      && nodeRepls[toStage] != 1)
                     produceArgs[2] = iterMod;
                   // Produce the condition into the sync array
                   BranchInst* branch = dyn_cast<BranchInst>(copy);
