@@ -1302,9 +1302,18 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
         auto f = outEdges[e.src].find(i);
         if (f == outEdges[e.src].end())
           outEdges[e.src].insert(std::make_pair(i, e));
-        else
-          assert(e.dependence == f->second.dependence
-                 && "Different dependence types not handled");
+        else {
+          if (e.dependence != f->second.dependence) {
+            if (e.dependence == DAGEdge::Type::PHI
+              && f->second.dependence == DAGEdge::Type::Control) { continue; }
+            else if (e.dependence == DAGEdge::Type::Control
+                     && f->second.dependence == DAGEdge::Type::PHI) {
+              f->second = e;
+            } else {
+              assert(false && "Different dependence types not handled");
+            }
+          }
+        }
       }
     }
 
@@ -1536,8 +1545,20 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
           } else {
             std::vector<DAGEdge>& edges = f->second;
             DAGEdge::Type type = edges[0].dependence;
+            //bool andPhi = false; // Control & Phi dependences can co-exist
             for (DAGEdge& e : edges) {
-              assert(e.dependence == type && "Dependence has multiple types");
+              if (e.dependence != type) {
+                if (type == DAGEdge::Type::Control
+                    && e.dependence == DAGEdge::Type::PHI) {
+                  //andPhi = true;
+                } else if (type == DAGEdge::Type::PHI
+                           && e.dependence == DAGEdge::Type::Control) {
+                  type = DAGEdge::Type::Control;
+                  //andPhi = true;
+                } else {
+                  assert(false && "Dependence has multiple types");
+                }
+              }
             }
             switch (type) {
               case DAGEdge::Type::Register: {
@@ -1586,7 +1607,10 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 Instruction* copy = inst.clone();
                 toRemap.push_back(copy);
                 builder.Insert(copy);
-              }; break;
+              }; break; //if (!andPhi) { break; } else { /* fall-through */ }
+              // THEORY: I think that if there is both a control and phi
+              // dependence we shouldn't need to handle the phi dependence
+              // specially
               case DAGEdge::Type::PHI: {
                 assert(false && "TODO");
                 // TODO
