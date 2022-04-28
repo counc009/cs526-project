@@ -1214,10 +1214,10 @@ static Value* truncateAndCast(IRBuilder<>& builder, Module& M,
 static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                    DominatorTree& DT) {
   // This map tracks the synchronization arrays and which values they represent
-  // and in what stage (the value and stage are the key, the value is the number
-  // of the synchronization array)
+  // and in what stage and what type they are (the value, stage, and type are
+  // the key, the value is the number of the synchronization array)
   int numSyncArrays = 0;
-  std::map<std::pair<const Value*, int>, int> syncArrays;
+  std::map<std::tuple<const Value*, int, DAGEdge::Type>, int> syncArrays;
   std::vector<int> syncArrayRepls;
   
   std::vector<int> nodeRepls; // Replication factor of each node
@@ -1307,25 +1307,11 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
 
     // Sort outgoing dependences, tracking the actual edge and the number of
     // the stage the dependence goes to
-    std::map<const Instruction*, std::map<int, DAGEdge>> outEdges;
+    std::map<const Instruction*, std::map<int, std::set<DAGEdge::Type>>> outEdges;
     for (int i = 0; i < numNodes; i++) {
       std::vector<DAGEdge> edges = partition.getEdge(n, i);
       for (DAGEdge e : edges) {
-        auto f = outEdges[e.src].find(i);
-        if (f == outEdges[e.src].end())
-          outEdges[e.src].insert(std::make_pair(i, e));
-        else {
-          if (e.dependence != f->second.dependence) {
-            if (e.dependence == DAGEdge::Type::PHI
-              && f->second.dependence == DAGEdge::Type::Control) { continue; }
-            else if (e.dependence == DAGEdge::Type::Control
-                     && f->second.dependence == DAGEdge::Type::PHI) {
-              f->second = e;
-            } else {
-              assert(false && "Different dependence types not handled");
-            }
-          }
-        }
+        outEdges[e.src][i].insert(e.dependence);
       }
     }
 
@@ -1479,11 +1465,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
 
           auto f = outEdges.find(&inst);
           if (f != outEdges.end()) {
-            std::map<int, DAGEdge> outs = f->second;
-            for (auto const& [toStage, edge] : outs) {
-              int syncArrayNum = syncArrays[std::make_pair(&inst, toStage)];
-              ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
- 
+            std::map<int, std::set<DAGEdge::Type>> outs = f->second;
+            for (auto const& [toStage, edgeTypes] : outs) {
               // For the replication to transmit to:
               // If communicating from a sequential stage to a parallel stage
               // use the "iteration counter"
@@ -1496,39 +1479,42 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                   : (Value*) instance)
                                : (Value*) iterCounter);
               std::vector<Value*> produceArgs
-                = {arrays, syncArrayArg, toInst, nullptr};
-              switch (edge.dependence) {
-                case DAGEdge::Type::Register: {
-                  // Just produce the value into the sync array
-                  produceArgs[3] = extendAndCast(builder, M, copy);
-                  builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
-                }; break;
-                case DAGEdge::Type::Memory: {
-                  // Just produce a value into the sync array
-                  produceArgs[3] = builder.getInt64(0);
-                  builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
-                }; break;
-                case DAGEdge::Type::Control: {
-                  // If this is the loop latch, produce for the next iteration
-                  if (&inst == loop->getLoopLatch()->getTerminator()
-                      && nodeRepls[toStage] != 1)
-                    produceArgs[2] = iterMod;
-                  // Produce the condition into the sync array
-                  BranchInst* branch = dyn_cast<BranchInst>(copy);
-                  assert(branch && branch->isConditional()
-                    && "Control dependence from instruction not a conditional branch");
-                  Value* newCond = mapper.mapValue(*branch->getCondition());
-                  assert(newCond->getType() == Type::getInt1Ty(M.getContext())
-                         && "Condition has type other than i1");
-                  // Insert code before the branch
-                  produceArgs[3] = CastInst::CreateZExtOrBitCast(
-                      newCond, Type::getInt64Ty(M.getContext()), "", copy);
-                  CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
-                                   "", copy);
-                }; break;
-                case DAGEdge::Type::PHI: {
-                  assert(false && "TODO: Handle PHI dependences");
-                }; break;
+                = {arrays, nullptr, toInst, nullptr};
+              if (edgeTypes.find(DAGEdge::Type::Register) != edgeTypes.end()) {
+                // Just produce the value into the sync array
+                produceArgs[1] = builder.getInt32(
+                  syncArrays[std::make_tuple(&inst, toStage, DAGEdge::Type::Register)]);
+                produceArgs[3] = extendAndCast(builder, M, copy);
+                builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+              }
+              if (edgeTypes.find(DAGEdge::Type::Memory) != edgeTypes.end()) {
+                // Just produce a value into the sync array
+                produceArgs[1] = builder.getInt32(
+                  syncArrays[std::make_tuple(&inst, toStage, DAGEdge::Type::Memory)]);
+                produceArgs[3] = builder.getInt64(0);
+                builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+              }
+              if (edgeTypes.find(DAGEdge::Type::Control) != edgeTypes.end()) {
+                produceArgs[1] = builder.getInt32(
+                  syncArrays[std::make_tuple(&inst, toStage, DAGEdge::Type::Control)]);
+                // If this is the loop latch, produce for the next iteration
+                if (&inst == loop->getLoopLatch()->getTerminator()
+                    && nodeRepls[toStage] != 1)
+                  produceArgs[2] = iterMod;
+                // Produce the condition into the sync array
+                BranchInst* branch = dyn_cast<BranchInst>(copy);
+                assert(branch && branch->isConditional()
+                  && "Control dependence from instruction not a conditional branch");
+                Value* newCond = mapper.mapValue(*branch->getCondition());
+                assert(newCond->getType() == Type::getInt1Ty(M.getContext())
+                       && "Condition has type other than i1");
+                // Insert code before the branch
+                produceArgs[3] = CastInst::CreateZExtOrBitCast(
+                    newCond, Type::getInt64Ty(M.getContext()), "", copy);
+                CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
+                                 "", copy);
+              } else if (edgeTypes.find(DAGEdge::Type::PHI) != edgeTypes.end()) {
+                assert(false && "TODO: Handle PHI dependences");
               }
             }
           }
@@ -1563,95 +1549,120 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
             }
           } else {
             std::vector<std::pair<int, DAGEdge>>& edges = f->second;
-            DAGEdge::Type type = edges[0].second.dependence;
-            int fromRepl = nodeRepls[edges[0].first];
-            //bool andPhi = false; // Control & Phi dependences can co-exist
+            bool hasRegDependence = false;
+            bool hasMemDependence = false;
+            bool hasControlDependence = false;
+            bool hasPhiDependence = false;
+            
+            int fromReplReg = 0;
+            int fromReplMem = 0;
+            int fromReplControl = 0;
+            int fromReplPhi = 0;
+            
             for (std::pair<int, DAGEdge>& pair : edges) {
               DAGEdge& e = pair.second;
-              if (e.dependence != type) {
-                if (type == DAGEdge::Type::Control
-                    && e.dependence == DAGEdge::Type::PHI) {
-                  //andPhi = true;
-                } else if (type == DAGEdge::Type::PHI
-                           && e.dependence == DAGEdge::Type::Control) {
-                  type = DAGEdge::Type::Control;
-                  //andPhi = true;
-                } else {
-                  assert(false && "Dependence has multiple types");
-                }
+              switch (e.dependence) {
+                case DAGEdge::Type::Register: {
+                  assert((fromReplReg == 0
+                          || fromReplReg == nodeRepls[pair.first])
+                    && "Same dependence from stages of different replications");
+                  hasRegDependence = true;
+                  fromReplReg = nodeRepls[pair.first];
+                  break; }
+                case DAGEdge::Type::Memory: {
+                  assert((fromReplMem == 0
+                          || fromReplMem == nodeRepls[pair.first])
+                    && "Same dependence from stages of different replications");
+                  hasMemDependence = true;
+                  fromReplMem = nodeRepls[pair.first];
+                  break; }
+                case DAGEdge::Type::Control: {
+                  assert((fromReplControl == 0
+                          || fromReplControl == nodeRepls[pair.first])
+                    && "Same dependence from stages of different replications");
+                  hasControlDependence = true;
+                  fromReplControl = nodeRepls[pair.first];
+                  break; }
+                case DAGEdge::Type::PHI: {
+                  assert((fromReplControl == 0
+                          || fromReplControl == nodeRepls[pair.first])
+                    && "Same dependence from stages of different replications");
+                  hasPhiDependence = true;
+                  fromReplPhi = nodeRepls[pair.first];
+                  break; }
               }
-              assert(nodeRepls[pair.first] == fromRepl
-                && "Dependence comes from stages with different replications");
             }
-            assert((nodeRepls[n] == 1 || fromRepl == 1)
-                && "Communication between parallel stages not supported");
-            switch (type) {
-              case DAGEdge::Type::Register: {
+            if(hasRegDependence) {
+              assert((nodeRepls[n] == 1 || fromReplReg == 1)
+                  && "Communication between parallel stages not supported");
+              int syncArrayNum = numSyncArrays++;
+              // If the dependence comes from a parallel stage, we have an
+              // array for each instance of the parallel stage to enforce
+              // the correct ordering
+              syncArrayRepls.push_back(fromReplReg == 1 ? nodeRepls[n] : fromReplReg);
+              syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Register)] = syncArrayNum;
+              ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+              std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                  fromReplReg == 1
+                                                    ? (Value*) instance
+                                                    : (Value*) iterCounter}; 
+              CallInst* consumeInst
+                = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+              vmap[&inst] = truncateAndCast(builder, M, consumeInst,
+                                            inst.getType(), inst.getName());
+            }
+            if (hasMemDependence) {
+              assert((nodeRepls[n] == 1 || fromReplMem == 1)
+                  && "Communication between parallel stages not supported");
+              // For memory we consume just to signal that the memory
+              // operation depended on has occured
+              int syncArrayNum = numSyncArrays++;
+              syncArrayRepls.push_back(fromReplMem == 1 ? nodeRepls[n] : fromReplMem);
+              syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Memory)] = syncArrayNum;
+              ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+              std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                  fromReplMem == 1
+                                                    ? (Value*) instance
+                                                    : (Value*) iterCounter};
+              CallInst* consumeInst
+                = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+            }
+            if (hasControlDependence) {
+              assert((nodeRepls[n] == 1 || fromReplControl == 1)
+                  && "Communication between parallel stages not supported");
+              // For control dependences, this instruction must be a
+              // conditional branch and we consume the condition to use
+              const BranchInst* branch = dyn_cast<BranchInst>(&inst);
+              assert(branch && branch->isConditional()
+                     && "Control dependence from inst not a conditional branch");
+              Value* cond = branch->getCondition();
+              if (vmap.find(cond) == vmap.end()) {
                 int syncArrayNum = numSyncArrays++;
-                // If the dependence comes from a parallel stage, we have an
-                // array for each instance of the parallel stage to enforce
-                // the correct ordering
-                syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
-                syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
+                syncArrayRepls.push_back(fromReplControl == 1 ? nodeRepls[n] : fromReplControl);
+                syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Control)] = syncArrayNum;
                 ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
                 std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
-                                                    fromRepl == 1
-                                                      ? (Value*) instance
-                                                      : (Value*) iterCounter}; 
-                CallInst* consumeInst
-                  = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
-                vmap[&inst] = truncateAndCast(builder, M, consumeInst,
-                                              inst.getType(), inst.getName());
-              }; break;
-              case DAGEdge::Type::Memory: {
-                // For memory we consume just to signal that the memory
-                // operation depended on has occured
-                int syncArrayNum = numSyncArrays++;
-                syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
-                syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
-                ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
-                                                    fromRepl == 1
+                                                    fromReplControl == 1
                                                       ? (Value*) instance
                                                       : (Value*) iterCounter};
                 CallInst* consumeInst
                   = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
-              }; break;
-              case DAGEdge::Type::Control: {
-                // For control dependences, this instruction must be a
-                // conditional branch and we consume the condition to use
-                const BranchInst* branch = dyn_cast<BranchInst>(&inst);
-                assert(branch && branch->isConditional()
-                       && "Control dependence from inst not a conditional branch");
-                Value* cond = branch->getCondition();
-                if (vmap.find(cond) == vmap.end()) {
-                  int syncArrayNum = numSyncArrays++;
-                  syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
-                  syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
-                  ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
-                                                      fromRepl == 1
-                                                        ? (Value*) instance
-                                                        : (Value*) iterCounter};
-                  CallInst* consumeInst
-                    = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
-                  Value* newCond = truncateAndCast(builder, M, consumeInst,
-                                                Type::getInt1Ty(M.getContext()),
-                                                "");
-                  vmap[cond] = newCond;
-                }
-                
-                Instruction* copy = inst.clone();
-                toRemap.push_back(copy);
-                builder.Insert(copy);
-              }; break; //if (!andPhi) { break; } else { /* fall-through */ }
-              // THEORY: I think that if there is both a control and phi
-              // dependence we shouldn't need to handle the phi dependence
-              // specially
-              case DAGEdge::Type::PHI: {
-                assert(false && "TODO");
-                // TODO
-              }; break;
+                Value* newCond = truncateAndCast(builder, M, consumeInst,
+                                              Type::getInt1Ty(M.getContext()),
+                                              "");
+                vmap[cond] = newCond;
+              }
+              
+              Instruction* copy = inst.clone();
+              toRemap.push_back(copy);
+              builder.Insert(copy);
+            } else if (hasPhiDependence) {
+              // If we insert the branch (because of a control dependence)
+              // we don't need to handle the PHI specially anymore
+              assert((nodeRepls[n] == 1 || fromReplPhi == 1)
+                  && "Communication between parallel stages not supported");
+              assert(false && "TODO");
+              // TODO
             }
           }
         }
@@ -1674,7 +1685,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     // loop's latch instruction
     Instruction* latch = loop->getLoopLatch()->getTerminator();
     if (stageInsts.find(latch) == stageInsts.end()) {
-      int syncArrayNum = syncArrays[std::make_pair(latch, n)];
+      int syncArrayNum = syncArrays[std::make_tuple(latch, n, DAGEdge::Type::Control)];
       IRBuilder builder(entry);
       ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
       std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
@@ -1765,7 +1776,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                        builder.getInt32(0),
                                        builder.getInt64(exitsOn0 ? 1 : 0)};
     for (int n = 0; n < numNodes; n++) {
-      auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
+      auto f = syncArrays.find(std::make_tuple(loopLatchInst, n, DAGEdge::Type::Control));
       if (f != syncArrays.end()) {
         int syncArray = f->second;
         produceArgs[1] = builder.getInt32(syncArray);
@@ -1834,7 +1845,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                      builder.getInt32(0), // placeholder
                                      builder.getInt64(exitsOn0 ? 0 : 1)};
   for (int n = 0; n < numNodes; n++) {
-    auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
+    auto f = syncArrays.find(std::make_tuple(loopLatchInst, n, DAGEdge::Type::Control));
     if (f != syncArrays.end()) {
       int syncArray = f->second;
       int repl = nodeRepls[n];
