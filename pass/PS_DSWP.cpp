@@ -839,7 +839,7 @@ static DAG threadPartitioning(DAG dag) {
   std::set<int> sequential_blocks;
   DAG dag_threaded;
 
-  errs() << "In threadPartitioning()\n";
+  LLVM_DEBUG(dbgs() << "In threadPartitioning()\n");
 
   auto findEdgesBetweenBlocks = [&](int block1, int block2) {
     std::vector<DAGEdge> edges;
@@ -877,7 +877,7 @@ static DAG threadPartitioning(DAG dag) {
   // Merge DOALL nodes
   bool merged = false;
   do {
-    errs() << "[psdswp] Entered DOALL do-while in threadPartitioning()\n";
+    LLVM_DEBUG(dbgs() << "[psdswp] Entered DOALL do-while in threadPartitioning()\n");
     merged = false;
 
     auto it = doall_blocks.begin();
@@ -913,20 +913,22 @@ static DAG threadPartitioning(DAG dag) {
         mergeBlocks(firstBlock, secondBlock);
         innerIt = doall_blocks.erase(innerIt);
         merged = true;
-        errs() << "[psdswp] Merged blocks " << firstBlock << " and " << secondBlock << "\n";
+        LLVM_DEBUG(dbgs() << "[psdswp] Merged blocks " << firstBlock << " and "
+                          << secondBlock << "\n");
       }
       ++it;
     }
   } while (merged);
 
-  errs() << "[psdswp] After merging DOALL:\n";
+  LLVM_DEBUG(dbgs() << "[psdswp] After merging DOALL:\n");
+  LLVM_DEBUG(
   for (auto it : blockToNodes) {
-    errs() << "\tBlock " << it.first << " : ";
+    dbgs() << "\tBlock " << it.first << " : ";
     for (int i : it.second) {
-      errs() << i << " ";
+      dbgs() << i << " ";
     }
-    errs() << "\n";
-  }
+    dbgs() << "\n";
+  });
   
   
   //Naive approach - most number of instructions (Actually decide this based on max profile weight)
@@ -944,11 +946,13 @@ static DAG threadPartitioning(DAG dag) {
   		}
   	}
   if(max != -1){
-		errs() << "[psdswp] Max Profile block " << nodeIndex << " number of instructions  " << max << "\n";
+		LLVM_DEBUG(dbgs() << "[psdswp] Max Profile block " << nodeIndex
+                      << " number of instructions  " << max << "\n");
 		for (auto it : doall_blocks) {
 			if(it!=nodeIndex)
 				{
-				errs() << "[psdswp] Converting block from doall to sequential " << it << "\n";
+				LLVM_DEBUG(dbgs() << "[psdswp] Converting block from doall to sequential "
+                          << it << "\n");
 				doall_blocks.erase(it);
 				sequential_blocks.insert(it);
 				}
@@ -959,7 +963,7 @@ static DAG threadPartitioning(DAG dag) {
   // Merge SEQUENTIAL nodes
   bool mergedSeq = false;
   do {
-    errs() << "[psdswp] Entered SEQUENTIAL do-while in  threadPartitioning()\n";
+    LLVM_DEBUG(dbgs() << "[psdswp] Entered SEQUENTIAL do-while in  threadPartitioning()\n");
     mergedSeq = false;
 
     auto it = sequential_blocks.begin();
@@ -971,8 +975,10 @@ static DAG threadPartitioning(DAG dag) {
       ++innerIt;
       while (innerIt != end) {
         int secondBlock = *innerIt;
-        errs() << "[psdswp] TRYING TO MERGE " << firstBlock << " and "
-               << secondBlock << "(" << existsLongPathBlocks(firstBlock, secondBlock) << ")\n";
+        LLVM_DEBUG(dbgs() << "[psdswp] TRYING TO MERGE " << firstBlock << " and "
+                          << secondBlock << "("
+                          << existsLongPathBlocks(firstBlock, secondBlock)
+                          << ")\n");
         
         // Check Condition 1 for valid assignment from the paper (that there does not exist a path
         // containing one or more intermediate nodes between the two candidates
@@ -983,20 +989,22 @@ static DAG threadPartitioning(DAG dag) {
         mergeBlocks(firstBlock, secondBlock);
         innerIt = sequential_blocks.erase(innerIt);
         mergedSeq = true;
-        errs() << "[psdswp] Merged blocks " << firstBlock << " and " << secondBlock << "\n";
+        LLVM_DEBUG(dbgs() << "[psdswp] Merged blocks " << firstBlock << " and "
+                          << secondBlock << "\n");
       }
       ++it;
     }
   } while (mergedSeq);
   
-  errs() << "[psdswp] After merging SEQUENTIAL:\n";
+  LLVM_DEBUG(dbgs() << "[psdswp] After merging SEQUENTIAL:\n");
+  LLVM_DEBUG(
   for (auto it : blockToNodes) {
-    errs() << "\tBlock " << it.first << " : ";
+    dbgs() << "\tBlock " << it.first << " : ";
     for (int i : it.second) {
-      errs() << i << " ";
+      dbgs() << i << " ";
     }
-    errs() << "\n";
-  }
+    dbgs() << "\n";
+  });
   //errs() << "[psdswp] Node to block size " << nodeToBlock.size()<< "\n";
   //errs() << "[psdswp] Block to node size :" << blockToNodes.size()<< "\n";
   for (auto it : blockToNodes) 
@@ -1016,7 +1024,8 @@ static DAG threadPartitioning(DAG dag) {
   }
   
   for(auto it1 : nodeToBlock)
-		errs() << "[psdswp] node to blocks :" << it1.first << "->"<< it1.second <<  "\n";
+		LLVM_DEBUG(dbgs() << "[psdswp] node to blocks :" << it1.first << "->"
+                      << it1.second <<  "\n");
 	
 
 
