@@ -1246,15 +1246,17 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   // Find number of incoming edges for each node in the partitioned graph
   // Also, init set s to contain the nodes with no incoming edges
   std::vector<int> numIncoming;
-  std::vector<std::vector<DAGEdge>> incomingEdges;
+  // Pair of the source node and the DAGEdge
+  std::vector<std::vector<std::pair<int, DAGEdge>>> incomingEdges;
   for (int i = 0; i < numNodes; i++) {
     int numEdges = 0;
-    incomingEdges.push_back(std::vector<DAGEdge>{});
+    incomingEdges.push_back(std::vector<std::pair<int, DAGEdge>>{});
     for (int j = 0; j < numNodes; j++) {
       std::vector<DAGEdge> edges = partition.getEdge(j, i);
       // Only count one edge for simplicity
       if (!edges.empty()) numEdges++;
-      incomingEdges[i].insert(incomingEdges[i].end(), edges.begin(), edges.end());
+      for (DAGEdge e : edges)
+        incomingEdges[i].push_back(std::make_pair(j, e));
     }
     numIncoming.push_back(numEdges);
     if (numEdges == 0) s.push_back(i);
@@ -1283,15 +1285,16 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     DAGNode& node = partition.getNode(n);
     LLVM_DEBUG(dbgs() << "Code-generating for node " << n << "\n");
 
-    std::vector<DAGEdge>& inEdges = incomingEdges[n];
+    std::vector<std::pair<int, DAGEdge>>& inEdges = incomingEdges[n];
 
     // Place instructions in this part into a set for easier lookup
     std::set<const Instruction*> stageInsts;
     for (Instruction* inst : node.insts) stageInsts.insert(inst);
 
     // Sort incoming dependences by the source instruction
-    std::map<const Instruction*, std::vector<DAGEdge>> dependences;
-    for (DAGEdge& edge : inEdges) dependences[edge.src].push_back(edge);
+    std::map<const Instruction*, std::vector<std::pair<int, DAGEdge>>> dependences;
+    for (std::pair<int, DAGEdge>& pair : inEdges)
+      dependences[pair.second.src].push_back(pair);
 
     // Sort outgoing dependences, tracking the actual edge and the number of
     // the stage the dependence goes to
@@ -1471,10 +1474,17 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
             for (auto const& [toStage, edge] : outs) {
               int syncArrayNum = syncArrays[std::make_pair(&inst, toStage)];
               ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-              // For parallel stages, use the "iteration counter" we created
-              // and for sequential stages just use 0
+              
+              // For the replication to transmit to:
+              // If communicating from a sequential stage to a parallel stage
+              // use the "iteration counter"
+              // If communicating between sequential stages just use 0
+              // If communicating from a parallel stage to a sequential stage
+              // use the instance number of this thread
               Value* toInst = (nodeRepls[toStage] == 1
-                               ? (Value*) builder.getInt32(0)
+                               ? (nodeRepls[n] == 1
+                                  ? (Value*) builder.getInt32(0)
+                                  : (Value*) instance)
                                : (Value*) iterCounter);
               std::vector<Value*> produceArgs
                 = {arrays, syncArrayArg, toInst, nullptr};
@@ -1543,10 +1553,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               }
             }
           } else {
-            std::vector<DAGEdge>& edges = f->second;
-            DAGEdge::Type type = edges[0].dependence;
+            std::vector<std::pair<int, DAGEdge>>& edges = f->second;
+            DAGEdge::Type type = edges[0].second.dependence;
+            int fromRepl = nodeRepls[edges[0].first];
             //bool andPhi = false; // Control & Phi dependences can co-exist
-            for (DAGEdge& e : edges) {
+            for (std::pair<int, DAGEdge>& pair : edges) {
+              DAGEdge& e = pair.second;
               if (e.dependence != type) {
                 if (type == DAGEdge::Type::Control
                     && e.dependence == DAGEdge::Type::PHI) {
@@ -1559,14 +1571,24 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                   assert(false && "Dependence has multiple types");
                 }
               }
+              assert(nodeRepls[pair.first] == fromRepl
+                && "Dependence comes from stages with different replications");
             }
+            assert((nodeRepls[n] == 1 || fromRepl == 1)
+                && "Communication between parallel stages not supported");
             switch (type) {
               case DAGEdge::Type::Register: {
                 int syncArrayNum = numSyncArrays++;
-                syncArrayRepls.push_back(nodeRepls[n]);
+                // If the dependence comes from a parallel stage, we have an
+                // array for each instance of the parallel stage to enforce
+                // the correct ordering
+                syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
                 syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                 ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                    fromRepl == 1
+                                                      ? (Value*) instance
+                                                      : (Value*) iterCounter}; 
                 CallInst* consumeInst
                   = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
                 vmap[&inst] = truncateAndCast(builder, M, consumeInst,
@@ -1576,10 +1598,13 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 // For memory we consume just to signal that the memory
                 // operation depended on has occured
                 int syncArrayNum = numSyncArrays++;
-                syncArrayRepls.push_back(nodeRepls[n]);
+                syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
                 syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                 ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                    fromRepl == 1
+                                                      ? (Value*) instance
+                                                      : (Value*) iterCounter};
                 CallInst* consumeInst
                   = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
               }; break;
@@ -1592,10 +1617,13 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 Value* cond = branch->getCondition();
                 if (vmap.find(cond) == vmap.end()) {
                   int syncArrayNum = numSyncArrays++;
-                  syncArrayRepls.push_back(nodeRepls[n]);
+                  syncArrayRepls.push_back(fromRepl == 1 ? nodeRepls[n] : fromRepl);
                   syncArrays[std::make_pair(&inst, n)] = syncArrayNum;
                   ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
+                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                      fromRepl == 1
+                                                        ? (Value*) instance
+                                                        : (Value*) iterCounter};
                   CallInst* consumeInst
                     = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
                   Value* newCond = truncateAndCast(builder, M, consumeInst,
