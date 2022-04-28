@@ -1474,7 +1474,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
             for (auto const& [toStage, edge] : outs) {
               int syncArrayNum = syncArrays[std::make_pair(&inst, toStage)];
               ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-              
+ 
               // For the replication to transmit to:
               // If communicating from a sequential stage to a parallel stage
               // use the "iteration counter"
@@ -1745,7 +1745,27 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     builder.CreateCall(psdswp.createSyncArrays, ArrayRef<Value*>(createArgs),
                        "sync.array");
 
-  // (2) Create structs for each stage instance and launch the stage instance
+  // (2) Signaling the first iteration of any stage which needs it (for parallel
+  // stages we only signal the first instance)
+  // This must be done before we create any of the stages since it otherwise
+  // produces a race condition with the main stage finishing the loop before
+  // this code is executed
+  {
+    std::vector<Value*> produceArgs = {syncArray,
+                                       builder.getInt32(0), // placeholder
+                                       builder.getInt32(0),
+                                       builder.getInt64(exitsOn0 ? 1 : 0)};
+    for (int n = 0; n < numNodes; n++) {
+      auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
+      if (f != syncArrays.end()) {
+        int syncArray = f->second;
+        produceArgs[1] = builder.getInt32(syncArray);
+        builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+      }
+    }
+  }
+
+  // (3) Create structs for each stage instance and launch the stage instance
   std::vector<std::vector<CallInst*>> threadIds;
   for (int n = 0; n < numNodes; n++) {
     threadIds.push_back(std::vector<CallInst*>{});
@@ -1783,23 +1803,6 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
       };
       threadIds[n].push_back(
         builder.CreateCall(psdswp.launchStage, ArrayRef<Value*>(launchArgs)));
-    }
-  }
-
-  // (3) Signaling the first iteration of any stage which needs it (for parallel
-  // stages we only signal the first instance)
-  {
-    std::vector<Value*> produceArgs = {syncArray,
-                                       builder.getInt32(0), // placeholder
-                                       builder.getInt32(0),
-                                       builder.getInt64(exitsOn0 ? 1 : 0)};
-    for (int n = 0; n < numNodes; n++) {
-      auto f = syncArrays.find(std::make_pair(loopLatchInst, n));
-      if (f != syncArrays.end()) {
-        int syncArray = f->second;
-        produceArgs[1] = builder.getInt32(syncArray);
-        builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
-      }
     }
   }
 
