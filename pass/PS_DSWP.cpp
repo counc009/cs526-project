@@ -1229,6 +1229,21 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   // stages needs
   std::map<int, std::vector<Value*>> stageInputs;
 
+  // Compute live-outs: values defined in the loop and used outside of it, and
+  // assign each a sync array that will be used to communicate it
+  std::map<Instruction*, int> liveOuts;
+  for (BasicBlock* bb : loop->blocks()) {
+    for (Instruction& inst : *bb) {
+      for (Value* user : inst.users()) {
+        Instruction* userI = dyn_cast<Instruction>(user);
+        if (userI && !loop->contains(userI)) {
+          liveOuts[&inst] = numSyncArrays++;
+          syncArrayRepls.push_back(1); // Live-outs just communicated over 1 array
+        }
+      }
+    }
+  }
+
   const int numNodes = partition.getNodeCount();
   Module& M = *(loop->getHeader()->getModule());
   Function& F = *(loop->getHeader()->getParent());
@@ -1363,10 +1378,6 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
 
     BasicBlock* entry = BasicBlock::Create(M.getContext(), "entry", func);
     BasicBlock* exit = BasicBlock::Create(M.getContext(), "exit", func);
-
-    // Return NULL
-    ReturnInst::Create(M.getContext(), ConstantPointerNull::get(voidPtr),
-      exit);
 
     // Cast argument to struct type
     CastInst* inputPtr = BitCastInst::CreatePointerCast(func->getArg(0),
@@ -1682,9 +1693,11 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
 
     // Add branch from entry to exit and loop header
     // To do this, consume a value from the synchronization array for the
-    // loop's latch instruction
+    // loop's latch instruction (if the stage is parallel) and for sequential
+    // stages the loop's guard (or lack of one) guarantees at least one
+    // iteration will be executed
     Instruction* latch = loop->getLoopLatch()->getTerminator();
-    if (stageInsts.find(latch) == stageInsts.end()) {
+    if (nodeRepls[n] != 1) {
       int syncArrayNum = syncArrays[std::make_tuple(latch, n, DAGEdge::Type::Control)];
       IRBuilder builder(entry);
       ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
@@ -1704,13 +1717,25 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
       branch->setCondition(cond);
       builder.Insert(branch);
     } else {
-      // The stage which contains the latch instruction is handled differently
-      // For now, require it to be sequential, which means the loop guard (or
-      // the absence of one) guarantees at least executio of the loop, just
-      // just jump directly to the loop
+      // For sequential stages just jump directly to the loop
       IRBuilder builder(entry);
       builder.CreateBr(static_cast<BasicBlock*>(mapper.mapValue(*loop->getHeader())));
     }
+
+    // Add communication of live outs
+    IRBuilder builder(exit);
+    for (Instruction* inst : node.insts) {
+      auto f = liveOuts.find(inst);
+      if (f == liveOuts.end()) continue;
+      assert(nodeRepls[n] == 1 && "Live-outs from DOALL stages not supported");
+      std::vector<Value*> produceArgs =
+        {arrays, builder.getInt32(f->second), builder.getInt32(0),
+         extendAndCast(builder, M, mapper.mapValue(*inst))};
+      builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
+    }
+
+    // Add return NULL
+    builder.CreateRet(ConstantPointerNull::get(voidPtr));
 
     // Remap all instructions that need it (we have to do this after all
     // instruction are in place to handle phi's)
@@ -1731,8 +1756,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   assert(loopLatchInst && "Loop latch terminator is not a branch");
   bool exitsOn0 = loopLatchInst->getSuccessor(1) != loop->getHeader();
 
-  BasicBlock* newLoop = BasicBlock::Create(M.getContext(), "loop.par",
-                                            loop->getHeader()->getParent());
+  BasicBlock* newLoop = BasicBlock::Create(M.getContext(), "loop.par", &F);
+  // Block for getting live-outs
+  BasicBlock* liveOutConsumes = BasicBlock::Create(M.getContext(), "loop.outs", &F);
   IRBuilder builder(newLoop);
   assert(loop->getLoopPreheader() && "Loop doesn't have a pre-header");
   assert(loop->getExitBlock() && "Loop doesn't have unique exit block");
@@ -1741,18 +1767,10 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
          && "Loop pre-header is not unconditional branch");
   branch->setSuccessor(0, newLoop);
   // Add branch to the exit block, and set the builder to insert before it
-  builder.SetInsertPoint(BranchInst::Create(loop->getExitBlock(), newLoop));
-  // TODO: Handle live outs
-  assert(loop->getExitBlock()->phis().empty() && "Live-outs not handled");
-  
-  // Now we delete the loop (first go through and drop references to avoid
-  // dependence issues as we go through and delete)
-  for (BasicBlock* bb : loop->blocks()) {
-    bb->dropAllReferences();
-  }
-  for (BasicBlock* bb : loop->blocks()) {
-    bb->eraseFromParent();
-  }
+  builder.SetInsertPoint(BranchInst::Create(liveOutConsumes, newLoop));
+    
+  IRBuilder outsBuilder(liveOutConsumes);
+  outsBuilder.SetInsertPoint(BranchInst::Create(loop->getExitBlock(), liveOutConsumes));
 
   // To launch the pipeline:
   // (1) Create the synchronization arrays
@@ -1764,9 +1782,31 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   CallInst* syncArray = 
     builder.CreateCall(psdswp.createSyncArrays, ArrayRef<Value*>(createArgs),
                        "sync.array");
+ 
+  // Now, replace uses of liveOuts with consumes
+  {
+    for (auto [inst, syncArrayNum] : liveOuts) {
+      std::vector<Value*> consumeArgs = {syncArray,
+                                         builder.getInt32(syncArrayNum),
+                                         builder.getInt32(0)};
+      CallInst* consumeInst = outsBuilder.CreateCall(psdswp.consume,
+                                ArrayRef<Value*>(consumeArgs));
+      inst->replaceAllUsesWith(truncateAndCast(outsBuilder, M, consumeInst,
+                                               inst->getType(), inst->getName()));
+    }
+  }
 
-  // (2) Signaling the first iteration of any stage which needs it (for parallel
-  // stages we only signal the first instance)
+  // Now we delete the loop (first go through and drop references to avoid
+  // dependence issues as we go through and delete)
+  for (BasicBlock* bb : loop->blocks()) {
+    bb->dropAllReferences();
+  }
+  for (BasicBlock* bb : loop->blocks()) {
+    bb->eraseFromParent();
+  }
+
+  // (2) Signaling the first iteration of any stage which needs it (these are
+  // parallel stages, and we only signal the first instance)
   // This must be done before we create any of the stages since it otherwise
   // produces a race condition with the main stage finishing the loop before
   // this code is executed
@@ -1776,8 +1816,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                        builder.getInt32(0),
                                        builder.getInt64(exitsOn0 ? 1 : 0)};
     for (int n = 0; n < numNodes; n++) {
-      auto f = syncArrays.find(std::make_tuple(loopLatchInst, n, DAGEdge::Type::Control));
-      if (f != syncArrays.end()) {
+      if (nodeRepls[n] != 1) {
+        auto f = syncArrays.find(std::make_tuple(loopLatchInst, n, DAGEdge::Type::Control));
+        assert(f != syncArrays.end() && "Parallel stage without dependence on latch");
         int syncArray = f->second;
         produceArgs[1] = builder.getInt32(syncArray);
         builder.CreateCall(psdswp.produce, ArrayRef<Value*>(produceArgs));
@@ -1868,14 +1909,14 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     }
   }
   
-  // (7) Free the synchronization arrays
+  // (7) Free the synchronization arrays (after consuming live-outs)
   std::vector<Value*> freeArgs;
   freeArgs.push_back(syncArray);
-  freeArgs.push_back(builder.getInt32(numSyncArrays));
+  freeArgs.push_back(outsBuilder.getInt32(numSyncArrays));
   for (int repl : syncArrayRepls) {
-    freeArgs.push_back(builder.getInt32(repl));
+    freeArgs.push_back(outsBuilder.getInt32(repl));
   }
-  builder.CreateCall(psdswp.freeSyncArrays, ArrayRef<Value*>(freeArgs));
+  outsBuilder.CreateCall(psdswp.freeSyncArrays, ArrayRef<Value*>(freeArgs));
 
   return true;
 }
