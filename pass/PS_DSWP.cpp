@@ -87,13 +87,13 @@ namespace {
   public:
     int insertNode(TNode node) {
       int i = nodes.size();
-      nodes.push_back(node); 
+      nodes.push_back(node);
       edges.push_back(std::map<int, std::vector<TEdge>>());
       return i;
     }
 
     TNode& getNode(int n) { return nodes[n]; }
-    
+
     int getNodeCount() { return nodes.size(); }
 
     void addEdge(int src, int dst, TEdge edge) {
@@ -106,7 +106,7 @@ namespace {
         nodeEdges[dst] = std::vector<TEdge>({edge});
       }
     }
-    
+
     bool hasLoopCarriedEdge(int src, int dst) {
       std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
@@ -115,35 +115,35 @@ namespace {
         for(size_t i = 0;i<edge_list.size();i++)
         	if(edge_list[i].loopCarried == true)
         		return true;
-      } 
+      }
         return false;
     }
-    
+
     std::vector<int> getAdjs(int src) {
       auto nodeEdges = edges[src];
       std::vector<int> adj;
       for (auto const& i : nodeEdges){
 	    //std::cout << i.first << ':'<< i.second << std::endl;
-	    adj.push_back(i.first);    
+	    adj.push_back(i.first);
 	    }
         return adj;
     }
-    
+
     bool hasEdge(int src, int dst) {
       auto nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
-      if (f != nodeEdges.end()) 
+      if (f != nodeEdges.end())
       	return true;
-      else 
+      else
       	return false;
     }
-    
+
     std::vector<TEdge> getEdge(int src, int dst) {
       std::map<int, std::vector<TEdge>>& nodeEdges = edges[src];
       auto f = nodeEdges.find(dst);
-      if (f != nodeEdges.end()) 
+      if (f != nodeEdges.end())
       	return nodeEdges[dst];
-      else 
+      else
       	return {};
     }
   };
@@ -187,7 +187,7 @@ namespace {
 
       do {
         WorkObject* currentW = &worklist.back();
-        
+
         BasicBlock* currentBB = currentW->currentBB;
         BasicBlock* parentBB  = currentW->parentBB;
 
@@ -288,19 +288,19 @@ void PS_DSWP::initializeParFuncs(Module& M) {
   FunctionType* produceTy
       = FunctionType::get(tyVoid, ArrayRef<Type*>(produceArgs), false);
   produce = M.getOrInsertFunction("produce", produceTy);
-  
+
   std::vector<Type*> consumeArgs = {tyI8Ptr, tyI32, tyI32};
   FunctionType* consumeTy
       = FunctionType::get(tyI64, ArrayRef<Type*>(consumeArgs), false);
   consume = M.getOrInsertFunction("consume", consumeTy);
-  
+
   Type* funcI8PtrToI8Ptr
     = FunctionType::get(tyI8Ptr, ArrayRef<Type*>(tyI8Ptr), false)->getPointerTo();
   std::vector<Type*> launchArgs = {tyI8Ptr, funcI8PtrToI8Ptr};
   FunctionType* launchTy
       = FunctionType::get(tyI64, ArrayRef<Type*>(launchArgs), false);
   launchStage = M.getOrInsertFunction("launchStage", launchTy);
-  
+
   std::vector<Type*> waitArgs = {tyI64};
   FunctionType* waitTy
       = FunctionType::get(tyVoid, ArrayRef<Type*>(waitArgs), false);
@@ -441,8 +441,8 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     maybeLoopIndependent = !liesBetween(&src, &dst, backedge->getTerminator(),
                                         &DT);
   }
-  
-  std::unique_ptr<Dependence> dependence = 
+
+  std::unique_ptr<Dependence> dependence =
     DI.depends(&src, &dst, maybeLoopIndependent);
   if (dependence != nullptr) {
     unsigned direction = dependence->getDirection(1);
@@ -520,7 +520,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
     && "Loop does not have unique incoming or back edge");
 
   std::map<Instruction*, int> nodes;
-  
+
   std::set<Instruction*> memInsts; // The instructions which touch memory
 
   for (BasicBlock* bb : loop->blocks()) {
@@ -561,7 +561,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                           PDGEdge(PDGEdge::Register, carried, opInst, &inst));
             LLVM_DEBUG(
               dbgs() << "[psdswp] Register dependence from " << *opInst
-                     << " to " << inst << (carried?" (loop carried)\n":"\n")); 
+                     << " to " << inst << (carried?" (loop carried)\n":"\n"));
           }
         }
       }
@@ -576,7 +576,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                           PDGEdge(PDGEdge::Register, carried, &inst, useInst));
             LLVM_DEBUG(
               dbgs() << "[psdswp] Register dependence from " << inst << " to "
-                     << *useInst << (carried ? " (loop carried)\n" : "\n")); 
+                     << *useInst << (carried ? " (loop carried)\n" : "\n"));
           }
         }
       }
@@ -688,7 +688,7 @@ static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> 
       LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
     LLVM_DEBUG(dbgs() <<"\n");
   }
-  
+
 	return dag_scc;
 }
 
@@ -713,7 +713,7 @@ static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
    LLVM_DEBUG(dbgs() <<"\n");
    */
 	for(size_t j=0;j<adjacents.size();j++)
-	{   
+	{
 		int v = adjacents[j]; // v is current adjacent of 'u'
 
 		// If v is not visited yet, then recur for it
@@ -790,11 +790,11 @@ static DAG computeDAGscc(PDG graph) {
       LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
     LLVM_DEBUG(dbgs() <<"\n");
   }
-  
+
   	DAG dag_scc;
   	std::map<int, std::vector<int>> scc_to_pdg_map; //map nodes of sccc to constituent pdg nodes
   	std::map<int, int> pdg_to_scc_map;  //map nodes of pdg to combind dag node
-  
+
 	int V = graph.getNodeCount();
   int *disc = new int[V];
 	int *low = new int[V];
@@ -826,7 +826,7 @@ static DAG computeDAGscc(PDG graph) {
       LLVM_DEBUG(dbgs() <<adjacents[j] << " ");
     LLVM_DEBUG(dbgs() <<"\n");
   } */
-  
+
   delete [] disc;
   delete [] low;
   delete [] stackMember;
@@ -838,7 +838,7 @@ static DAG computeDAGscc(PDG graph) {
 static bool existsLongPathSet(DAG& graph, std::set<int> srcs,
                               std::set<int> dsts) {
   std::set<int> considered = srcs;
-  
+
   std::queue<int> worklist;
   for (int src : srcs) {
     for (int n : graph.getAdjs(src)) {
@@ -867,7 +867,7 @@ static bool existsLongPathSet(DAG& graph, std::set<int> srcs,
 static DAG threadPartitioning(DAG dag) {
   std::map<int, int> nodeToBlock;
   std::map<int, std::set<int>> blockToNodes;
-  
+
   std::set<int> doall_blocks;
   std::set<int> sequential_blocks;
   DAG dag_threaded;
@@ -917,12 +917,12 @@ static DAG threadPartitioning(DAG dag) {
     auto end = doall_blocks.end();
     while (it != end) {
       int firstBlock = *it;
-      
+
       auto innerIt = it;
       ++innerIt;
       while (innerIt != end) {
         int secondBlock = *innerIt;
-        
+
         std::vector<DAGEdge> edges =
             findEdgesBetweenBlocks(firstBlock, secondBlock);
 
@@ -941,7 +941,7 @@ static DAG threadPartitioning(DAG dag) {
         // containing one or more intermediate nodes between the two candidates
         if (existsLongPathBlocks(firstBlock, secondBlock))
           { ++innerIt; continue; }
-        
+
         // Merge the blocks
         mergeBlocks(firstBlock, secondBlock);
         innerIt = doall_blocks.erase(innerIt);
@@ -962,8 +962,8 @@ static DAG threadPartitioning(DAG dag) {
     }
     dbgs() << "\n";
   });
-  
-  
+
+
   //Naive approach - most number of instructions (Actually decide this based on max profile weight)
   int max = -1;
   int nodeIndex = -1;
@@ -992,7 +992,7 @@ static DAG threadPartitioning(DAG dag) {
   	}
   }
 
-  
+
   // Merge SEQUENTIAL nodes
   bool mergedSeq = false;
   do {
@@ -1003,7 +1003,7 @@ static DAG threadPartitioning(DAG dag) {
     auto end = sequential_blocks.end();
     while (it != end) {
       int firstBlock = *it;
-      
+
       auto innerIt = it;
       ++innerIt;
       while (innerIt != end) {
@@ -1012,12 +1012,12 @@ static DAG threadPartitioning(DAG dag) {
                           << secondBlock << "("
                           << existsLongPathBlocks(firstBlock, secondBlock)
                           << ")\n");
-        
+
         // Check Condition 1 for valid assignment from the paper (that there does not exist a path
         // containing one or more intermediate nodes between the two candidates
         if (existsLongPathBlocks(firstBlock, secondBlock))
           { ++innerIt; continue; }
-        
+
         // Merge the blocks
         mergeBlocks(firstBlock, secondBlock);
         innerIt = sequential_blocks.erase(innerIt);
@@ -1028,7 +1028,7 @@ static DAG threadPartitioning(DAG dag) {
       ++it;
     }
   } while (mergedSeq);
-  
+
   LLVM_DEBUG(dbgs() << "[psdswp] After merging SEQUENTIAL:\n");
   LLVM_DEBUG(
   for (auto it : blockToNodes) {
@@ -1040,7 +1040,7 @@ static DAG threadPartitioning(DAG dag) {
   });
   //errs() << "[psdswp] Node to block size " << nodeToBlock.size()<< "\n";
   //errs() << "[psdswp] Block to node size :" << blockToNodes.size()<< "\n";
-  for (auto it : blockToNodes) 
+  for (auto it : blockToNodes)
   {
     DAGNode combined;
     std::vector<Instruction*> insts;
@@ -1055,14 +1055,14 @@ static DAG threadPartitioning(DAG dag) {
     dag_threaded.insertNode(combined);
 
   }
-  
+
   for(auto it1 : nodeToBlock)
 		LLVM_DEBUG(dbgs() << "[psdswp] node to blocks :" << it1.first << "->"
                       << it1.second <<  "\n");
 	
 
 
-  //Connect all edges, possibly repeats edges 
+  //Connect all edges, possibly repeats edges
   for(auto it1 : nodeToBlock){
 		for(auto it2 : nodeToBlock){
 			if(nodeToBlock[it1.first] == nodeToBlock[it2.first])
@@ -1106,7 +1106,7 @@ bool verifyPHIIteratesList(PHINode& phi, Loop* loop) {
     // From within the loop we want to verify that this value MUST be further
     // into the list; we do this by ensuring that it is calculated through
     // some number of loads and GEPs from this phi
-    
+
     do {
       if (LoadInst* load = dyn_cast<LoadInst>(value)) {
         Value* ptr = load->getPointerOperand();
@@ -1158,7 +1158,7 @@ static DataStructureAnalysis analyzeDataStructures(Loop* loop) {
         if (!verifyPHIIteratesList(phi, loop)) continue;
 
         LLVM_DEBUG(dbgs() << "Found acyclic linked list phi: " << phi << "\n");
-        
+
         // The phi and pointers derived from it (through GEPs) do not have loop
         // carried dependences on themselves
         std::list<Instruction*> pointers; pointers.push_back(&phi);
@@ -1252,7 +1252,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   int numSyncArrays = 0;
   std::map<std::tuple<const Value*, int, DAGEdge::Type>, int> syncArrays;
   std::vector<int> syncArrayRepls;
-  
+
   std::vector<int> nodeRepls; // Replication factor of each node
   std::vector<Function*> nodeFuncs; // Function for each stage
   std::vector<StructType*> nodeInputStructs; // Struct of inputs for each stage
@@ -1377,10 +1377,10 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
         }
       }
     }
-    
+
     // Function's input struct
     std::vector<Type*> structFields; std::vector<Value*> structValues;
-    
+
     // Add the instance number as the first argument
     structFields.push_back(Type::getInt32Ty(M.getContext()));
     // And an i8* (void*) for the synchronization arrays
@@ -1416,7 +1416,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     CastInst* inputPtr = BitCastInst::CreatePointerCast(func->getArg(0),
                             inputStructTy->getPointerTo(), "stage.arg",
                             entry);
-    
+
     // Load the values out of the struct
     ValueToValueMapTy vmap;
     ValueMapper mapper(vmap);
@@ -1426,7 +1426,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     std::vector<Value*> gepIdx;
     gepIdx.push_back(ConstantInt::get(tyI32, 0));
     gepIdx.push_back(ConstantInt::get(tyI32, 0));
-    
+
     for (Value* value : structValues) {
       gepIdx[1] = ConstantInt::get(tyI32, i);
       GetElementPtrInst* gep =
@@ -1546,12 +1546,18 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                     && nodeRepls[toStage] != 1)
                   produceArgs[2] = iterMod;
                 // Produce the condition into the sync array
-                BranchInst* branch = dyn_cast<BranchInst>(copy);
-                assert(branch && branch->isConditional()
-                  && "Control dependence from instruction not a conditional branch");
-                Value* newCond = mapper.mapValue(*branch->getCondition());
-                assert(newCond->getType() == Type::getInt1Ty(M.getContext())
-                       && "Condition has type other than i1");
+                Value* cond;
+                if (BranchInst* branch = dyn_cast<BranchInst>(copy)) {
+                  assert(branch->isConditional()
+                    && "Control dependence from unconditional branch");
+                  cond = branch->getCondition();
+                } else if (SwitchInst* swtch = dyn_cast<SwitchInst>(copy)) {
+                  cond = swtch->getCondition();
+                } else {
+                  assert(false
+                    && "Control dependence from instruction not branch or switch");
+                }
+                Value* newCond = mapper.mapValue(*cond);
                 // Insert code before the branch
                 produceArgs[3] = CastInst::CreateZExtOrBitCast(
                     newCond, Type::getInt64Ty(M.getContext()), "", copy);
@@ -1570,28 +1576,42 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
           if (f == dependences.end()) {
             // Ignore the instruction unless it's a terminator
             if (inst.isTerminator()) {
-              const BranchInst* branch = dyn_cast<BranchInst>(&inst);
-              assert(branch && "Encountered non-branch terminator in loop");
-
+              if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
               // For unconditional branches, just emit them and remap them
-              if (branch->isUnconditional()) {
-                Instruction* copy = inst.clone();
-                builder.Insert(copy);
-                toRemap.push_back(copy);
-              } else {
-                // For conditional branches pick one direction that does not
-                // traverse a back-edge
-                assert(branch->getNumSuccessors() == 2
-                      && "Conditional branch with more than 2 successors");
-                BasicBlock* succ1 = branch->getSuccessor(0);
-                BasicBlock* succ2 = branch->getSuccessor(1);
-                if (succ1 != bb && !DT.dominates(succ1, bb)) {
-                  toRemap.push_back(builder.CreateBr(succ1));
+                if (branch->isUnconditional()) {
+                  Instruction* copy = inst.clone();
+                  builder.Insert(copy);
+                  toRemap.push_back(copy);
                 } else {
-                  assert(succ2 != bb && !DT.dominates(succ2, bb)
-                    && "Unhandled: branch containing two back-edges");
-                  toRemap.push_back(builder.CreateBr(succ2));
+                  // For conditional branches pick one direction that does not
+                  // traverse a back-edge
+                  assert(branch->getNumSuccessors() == 2
+                        && "Conditional branch with more than 2 successors");
+                  BasicBlock* succ1 = branch->getSuccessor(0);
+                  BasicBlock* succ2 = branch->getSuccessor(1);
+                  if (succ1 != bb && !DT.dominates(succ1, bb)) {
+                    toRemap.push_back(builder.CreateBr(succ1));
+                  } else {
+                    assert(succ2 != bb && !DT.dominates(succ2, bb)
+                      && "Unhandled: branch containing two back-edges");
+                    toRemap.push_back(builder.CreateBr(succ2));
+                  }
                 }
+              } else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
+                // Pick one branch that does not traverse a back-edge
+                unsigned numSuccs = swtch->getNumSuccessors();
+                bool found = false;
+                for (unsigned i = 0; i < numSuccs; i++) {
+                  BasicBlock* succ = swtch->getSuccessor(i);
+                  if (succ != bb && !DT.dominates(succ, bb)) {
+                    toRemap.push_back(builder.CreateBr(succ));
+                    found = true;
+                    break;
+                  }
+                }
+                assert(found && "Encountered switch with only back edges");
+              } else {
+                assert(false && "Found loop terminator not a branch or switch");
               }
             }
           } else {
@@ -1600,12 +1620,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
             bool hasMemDependence = false;
             bool hasControlDependence = false;
             bool hasPhiDependence = false;
-            
+
             int fromReplReg = 0;
             int fromReplMem = 0;
             int fromReplControl = 0;
             int fromReplPhi = 0;
-            
+
             for (std::pair<int, DAGEdge>& pair : edges) {
               DAGEdge& e = pair.second;
               switch (e.dependence) {
@@ -1655,7 +1675,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
                                                   fromReplReg == 1
                                                     ? (Value*) instance
-                                                    : (Value*) iterCounter}; 
+                                                    : (Value*) iterCounter};
               CallInst* consumeInst
                 = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
               vmap[&inst] = truncateAndCast(builder, M, consumeInst,
@@ -1682,10 +1702,19 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                   && "Communication between parallel stages not supported");
               // For control dependences, this instruction must be a
               // conditional branch and we consume the condition to use
-              const BranchInst* branch = dyn_cast<BranchInst>(&inst);
-              assert(branch && branch->isConditional()
-                     && "Control dependence from inst not a conditional branch");
-              Value* cond = branch->getCondition();
+              Value* cond;
+
+              if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+                assert(branch->isConditional()
+                  && "Control dependence is from an unconditional branch");
+                cond = branch->getCondition();
+              } else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
+                cond = swtch->getCondition();
+              } else {
+                assert(false
+                  && "Control dependence from non-branch or switch");
+              }
+
               if (vmap.find(cond) == vmap.end()) {
                 int syncArrayNum = numSyncArrays++;
                 syncArrayRepls.push_back(fromReplControl == 1 ? nodeRepls[n] : fromReplControl);
@@ -1702,7 +1731,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                               "");
                 vmap[cond] = newCond;
               }
-              
+
               Instruction* copy = inst.clone();
               toRemap.push_back(copy);
               builder.Insert(copy);
@@ -1711,8 +1740,14 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               // we don't need to handle the PHI specially anymore
               assert((nodeRepls[n] == 1 || fromReplPhi == 1)
                   && "Communication between parallel stages not supported");
-              assert(false && "TODO");
-              // TODO
+
+              const BranchInst* branch = dyn_cast<BranchInst>(&inst);
+              assert(branch && "PHI dependence from non-branch instruction");
+              assert(branch->isUnconditional()
+                && "PHI dependences from conditional branches not handled");
+              Instruction* copy = inst.clone();
+              toRemap.push_back(copy);
+              builder.Insert(copy);
             }
           }
         }
@@ -1807,7 +1842,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   branch->setSuccessor(0, newLoop);
   // Add branch to the exit block, and set the builder to insert before it
   builder.SetInsertPoint(BranchInst::Create(liveOutConsumes, newLoop));
-    
+
   IRBuilder outsBuilder(liveOutConsumes);
   outsBuilder.SetInsertPoint(BranchInst::Create(loop->getExitBlock(), liveOutConsumes));
 
@@ -1818,10 +1853,10 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   for (int repl : syncArrayRepls) {
     createArgs.push_back(builder.getInt32(repl));
   }
-  CallInst* syncArray = 
+  CallInst* syncArray =
     builder.CreateCall(psdswp.createSyncArrays, ArrayRef<Value*>(createArgs),
                        "sync.array");
- 
+
   // Now, replace uses of liveOuts with consumes
   {
     for (auto [inst, syncArrayNum] : liveOuts) {
@@ -1875,18 +1910,18 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     StructType* nodeInput = nodeInputStructs[n];
     for (int inst = 0; inst < instances; inst++) {
       AllocaInst* input = builder.CreateAlloca(nodeInput);
-      
+
       // Add instance number
       std::vector<Value*> gepIndices = {builder.getInt32(0), builder.getInt32(0)};
       builder.CreateStore(
         builder.getInt32(inst),
         builder.CreateGEP(nodeInput, input, ArrayRef<Value*>(gepIndices)));
-      
+
       // Add synchronization arrays
       gepIndices[1] = builder.getInt32(1);
       builder.CreateStore(syncArray,
         builder.CreateGEP(nodeInput, input, ArrayRef<Value*>(gepIndices)));
-      
+
       // Add other arguments
       int i = 2;
       for (Value* arg : stageInputs[n]) {
@@ -1947,7 +1982,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
       }
     }
   }
-  
+
   // (7) Free the synchronization arrays (after consuming live-outs)
   std::vector<Value*> freeArgs;
   freeArgs.push_back(syncArray);
