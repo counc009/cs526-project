@@ -1,4 +1,5 @@
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/DominanceFrontier.h"
@@ -21,6 +22,10 @@
 #define DEBUG_TYPE "psdswp"
 
 using namespace llvm;
+
+STATISTIC(LoopsConsidered,  "Number of loops considered by PS-DSWP");
+STATISTIC(LoopsParallelized,  "Number of loops parallelized by PS-DSWP");
+STATISTIC(LoopStages,  "Number of loops stages created by PS-DSWP");
 
 namespace {
   cl::opt<unsigned int> numThreads("num-threads",
@@ -334,6 +339,16 @@ bool PS_DSWP::runOnFunction(Function &F) {
   // For now, just considering the top level loops. Not actually sure if this
   // is correct behavior in general
   for (Loop* loop : LI.getTopLevelLoops()) {
+    // There are many complications of code-generation for loops without a
+    // single exit or entry, so it's not clear how to handle them
+    if (!loop->getExitBlock() || !loop->getLoopPredecessor()) {
+      LLVM_DEBUG(dbgs() << "[psdswp] Skipping loop " << *loop << " as it "
+                           "lacks unique exit or entry\n");
+      continue;
+    }
+
+    LoopsConsidered++;
+
     // Determine which loads/stores cannot be loop-carried (based on the
     // data-structure declarations)
     DataStructureAnalysis DSA = analyzeDataStructures(loop);
@@ -352,6 +367,8 @@ bool PS_DSWP::runOnFunction(Function &F) {
     // TODO: Should probably have another performance estimate here to predict
     // whether this will actually perform result in a speed-up
 
+    LoopsParallelized++;
+    LoopStages += partitioned.getNodeCount();
     modified |= performParallelization(*this, partitioned, loop, DT);
   }
 
