@@ -777,7 +777,7 @@ static DAG computeDAGscc(PDG graph) {
   	std::map<int, int> pdg_to_scc_map;  //map nodes of pdg to combind dag node
   
 	int V = graph.getNodeCount();
-    int *disc = new int[V];
+  int *disc = new int[V];
 	int *low = new int[V];
 	bool *stackMember = new bool[V];
 	std::stack<int> *st = new std::stack<int>();
@@ -808,6 +808,11 @@ static DAG computeDAGscc(PDG graph) {
     LLVM_DEBUG(dbgs() <<"\n");
   } */
   
+  delete [] disc;
+  delete [] low;
+  delete [] stackMember;
+  delete st;
+
   return connectEdges(graph, dag_scc, scc_to_pdg_map, pdg_to_scc_map);
 }
 
