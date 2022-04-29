@@ -171,13 +171,15 @@ namespace {
 
     ReverseDominanceFrontier(Function& F) {
       PostDominatorTree PDT(F); // Note: PDT.dominates(A, B) <=> A postdom B
-      DomTreeNodeBase<BasicBlock>* Node = PDT[PDT.getRoot()];
-      BasicBlock* BB = Node->getBlock();
 
       std::vector<WorkObject> worklist;
       std::set<BasicBlock*> visited;
-      
-      worklist.push_back(WorkObject(BB, nullptr, Node, nullptr));
+
+      for (BasicBlock* BB : PDT.roots()) {
+        DomTreeNodeBase<BasicBlock>* Node = PDT[BB];
+        worklist.push_back(WorkObject(BB, nullptr, Node, nullptr));
+      }
+
       do {
         WorkObject* currentW = &worklist.back();
         
