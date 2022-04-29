@@ -3,8 +3,9 @@ import subprocess
 from tqdm import tqdm
 import sys
 
-reps = 100
-argN = '100'
+reps = 1000
+repsValgrind = 10
+argN = '1000'
 argSeed = '314159'
 
 executables = glob.glob('./*/*.exec')
@@ -20,6 +21,17 @@ for ex, ref in zip(executables, references):
 
   for i in tqdm(range(reps)):
     execProc = subprocess.Popen([ex, argN, argSeed], stdout=subprocess.PIPE)
+    execResult = execProc.communicate()[0]
+    if execProc.returncode != 0:
+      print('Executable returned non-0, failed')
+      sys.exit(1)
+    if execResult != refResult:
+      print('Executable produced different output, failed')
+      sys.exit(1)
+  for i in tqdm(range(repsValgrind)):
+    execProc = subprocess.Popen(['valgrind', ex, argN, argSeed],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
     execResult = execProc.communicate()[0]
     if execProc.returncode != 0:
       print('Executable returned non-0, failed')

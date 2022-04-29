@@ -58,7 +58,7 @@ namespace {
     PDGNode(Instruction* i) : inst(i) {}
   };
   struct PDGEdge {
-    enum Type { Register, Memory, Control, PHI };
+    enum Type { Register, Memory, Control, PHI, PHISelf };
     Type dependence;
     bool loopCarried;
     Instruction *src, *dst;
@@ -427,7 +427,7 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     DI.depends(&src, &dst, maybeLoopIndependent);
   if (dependence != nullptr) {
     unsigned direction = dependence->getDirection(1);
-    bool loopCarried = !dependence->isLoopIndependent() || !maybeLoopIndependent;
+    bool loopCarried = dependence->isConfused() || !dependence->isLoopIndependent();
 
     // The condition should actually be that they use the same pointer and that
     // pointer is known to vary by iteration
@@ -445,18 +445,18 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
           && fDst != DSA.notCarriedPointers.end()) {
         Value* derivedSrc = fSrc->second;
         Value* derivedDst = fDst->second;
-        std::set<Value*>& forwardDst = DSA.forwardPointers[derivedDst];
-        if (forwardDst.find(derivedSrc) != forwardDst.end()) {
-          // If dst is referencing a prior element in the list, set direction
-          // to LT
-          direction = Dependence::DVEntry::LT;
+        std::set<Value*>& forwardSrc = DSA.forwardPointers[derivedSrc];
+        if (forwardSrc.find(derivedDst) != forwardSrc.end()) {
+          // If dst is referencing a future element in the list, set direction
+          // to GT
+          direction = Dependence::DVEntry::GT;
         }
       }
     }
 
-    if (direction != Dependence::DVEntry::LT
+    if (direction != Dependence::DVEntry::GT
         && (loopCarried || (&src != &dst && !DT.dominates(&dst, &src)))) {
-      // Only include dependence that aren't negative or if the dependence
+      // Only include dependence that aren't positive or if the dependence
       // isn't loop carried, only include ones where the dst doesn't dominate
       // the src (i.e. exclude backwards dependences/non-carried self
       // dependences)
@@ -484,7 +484,7 @@ static void checkMemoryDependence(Instruction& src, Instruction& dst,
     } else {
       LLVM_DEBUG(
       dbgs() << "DISCARDING dependence from " << src << " to " << dst
-             << (direction == Dependence::DVEntry::LT ? " was LT" : " wasn't LT")
+             << (direction == Dependence::DVEntry::GT ? " was GT" : " wasn't GT")
              << "\n");
     }
   }
@@ -579,6 +579,15 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                 dbgs() << "[psdswp] PHI control dependence from " << *term
                        << " to " << *phi << (carried?" (loop carried)\n":"\n"));
             }
+          }
+          // Also, if the phi has a branch from the back edge, add a
+          // loop-carried self loop since the value depends on the iteration
+          // and so this cannot be placed in a parallel stage
+          if (bb == backedge) {
+            graph.addEdge(node, node,
+                PDGEdge(PDGEdge::PHISelf, true, phi, phi));
+            LLVM_DEBUG(
+              dbgs() << "[psdswp] PHI self dependence on " << *phi << "\n");
           }
         }
       } else if (BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
@@ -1527,6 +1536,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               } else if (edgeTypes.find(DAGEdge::Type::PHI) != edgeTypes.end()) {
                 assert(false && "TODO: Handle PHI dependences");
               }
+              if (edgeTypes.find(DAGEdge::Type::PHISelf) != edgeTypes.end()) {
+                LLVM_DEBUG(dbgs() << "Ignoring phi self edge in code-gen");
+              }
             }
           }
         } else {
@@ -1600,6 +1612,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                     && "Same dependence from stages of different replications");
                   hasPhiDependence = true;
                   fromReplPhi = nodeRepls[pair.first];
+                  break; }
+                case DAGEdge::Type::PHISelf: {
+                  LLVM_DEBUG(dbgs() << "Ignoring phi self edge");
                   break; }
               }
             }

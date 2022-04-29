@@ -9,3 +9,7 @@ struct node {
 typedef struct node* restrict tree_t;
 
 void operation(tree_t tree);
+
+#ifndef NULL
+#define NULL 0L
+#endif

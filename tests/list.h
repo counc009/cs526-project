@@ -6,3 +6,7 @@ struct node {
 typedef struct node* restrict list_t;
 
 void operation(list_t list);
+
+#ifndef NULL
+#define NULL 0L
+#endif

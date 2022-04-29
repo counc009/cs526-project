@@ -45,11 +45,23 @@ linked_list/%.ref: linked_list/%.opt.ll test_list.ll psdswp.ll
 linked_list/%.exec: linked_list/%.par.ll test_list.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
+tree/%.opt.ll: tree/%.ll
+	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
+
+tree/%.par.ll: tree/%.opt.ll
+	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
+
+tree/%.ref: tree/%.opt.ll test_tree.ll psdswp.ll
+	$(CLANG) -O3 $^ -o $@
+
+tree/%.exec: tree/%.par.ll test_tree.ll psdswp.ll
+	$(CLANG) -O3 $^ -o $@
+
 clean:
 	rm -rf *.ll *.exec *.ref */*.ll */*.exec */*.ref
 
 # Build the executables that are currently working
-working: array/increment.ref array/increment.exec array/incdec.ref array/incdec.exec array/squarenons.ref array/squarenons.exec linked_list/increment.ref linked_list/increment.exec linked_list/incdec.ref linked_list/incdec.exec linked_list/squarenons.ref linked_list/squarenons.exec
+working: array/increment.ref array/increment.exec array/incdec.ref array/incdec.exec array/incdecnext.ref array/incdecnext.exec array/incdecprev.ref array/incdecprev.exec array/squarenons.ref array/squarenons.exec array/runningsum.ref array/runningsum.exec array/sum.ref array/sum.exec linked_list/increment.ref linked_list/increment.exec linked_list/incdec.ref linked_list/incdec.exec linked_list/incdecnext.ref linked_list/incdecnext.exec linked_list/incdecprev.ref linked_list/incdecprev.exec linked_list/squarenons.ref linked_list/squarenons.exec linked_list/runningsum.ref linked_list/runningsum.exec linked_list/sum.ref linked_list/sum.exec
 
 .PHONY: clean working
 .PRECIOUS: %.ll
