@@ -63,5 +63,7 @@ clean:
 # Build the executables that are currently working
 working: array/increment.ref array/increment.exec array/incdec.ref array/incdec.exec array/incdecnext.ref array/incdecnext.exec array/incdecprev.ref array/incdecprev.exec array/squarenons.ref array/squarenons.exec array/runningsum.ref array/runningsum.exec array/sum.ref array/sum.exec linked_list/increment.ref linked_list/increment.exec linked_list/incdec.ref linked_list/incdec.exec linked_list/incdecnext.ref linked_list/incdecnext.exec linked_list/incdecprev.ref linked_list/incdecprev.exec linked_list/squarenons.ref linked_list/squarenons.exec linked_list/runningsum.ref linked_list/runningsum.exec linked_list/sum.ref linked_list/sum.exec
 
-.PHONY: clean working
+trees: tree/increment.ref tree/increment.exec tree/incdec.ref tree/incdec.exec tree/squarenons.ref tree/squarenons.exec
+
+.PHONY: clean working trees
 .PRECIOUS: %.ll

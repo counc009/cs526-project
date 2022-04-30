@@ -342,8 +342,12 @@ bool PS_DSWP::runOnFunction(Function &F) {
     // There are many complications of code-generation for loops without a
     // single exit or entry, so it's not clear how to handle them
     if (!loop->getExitBlock() || !loop->getLoopPredecessor()) {
-      LLVM_DEBUG(dbgs() << "[psdswp] Skipping loop " << *loop << " as it "
-                           "lacks unique exit or entry\n");
+      LLVM_DEBUG(dbgs() << "[psdswp] Skipping loop " << loop->getName()
+                        << " as it lacks unique exit or entry\n");
+      continue;
+    } else if (loop->getLoopLatch() != loop->getExitingBlock()) {
+      LLVM_DEBUG(dbgs() << "[psdswp] Skipping loop " << loop->getName()
+                        << " as it's latch is not a conditional branch\n");
       continue;
     }
 
@@ -981,15 +985,15 @@ static DAG threadPartitioning(DAG dag) {
   if(max != -1){
 		LLVM_DEBUG(dbgs() << "[psdswp] Max Profile block " << nodeIndex
                       << " number of instructions  " << max << "\n");
-		for (auto it : doall_blocks) {
-			if(it!=nodeIndex)
-				{
-				LLVM_DEBUG(dbgs() << "[psdswp] Converting block from doall to sequential "
-                          << it << "\n");
-				doall_blocks.erase(it);
-				sequential_blocks.insert(it);
-				}
-  	}
+    for (auto it = doall_blocks.begin(), end = doall_blocks.end();
+         it != end; ) {
+			if (*it != nodeIndex) {
+        sequential_blocks.insert(*it);
+        it = doall_blocks.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 
 
@@ -1334,6 +1338,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     assert(n == 0 && "Failed to construct topological sort");
   }
 
+  std::vector<int> extraLatchArrays;
+  bool latchEmitted = false;
+
   // We emit a function for each stage, it takes a struct containing all values
   // we use defined outside of the loop and the index of this instance
   // Traversing in reverse-topological order
@@ -1564,20 +1571,93 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
                                  "", copy);
               } else if (edgeTypes.find(DAGEdge::Type::PHI) != edgeTypes.end()) {
-                assert(false && "TODO: Handle PHI dependences");
+                const BranchInst* branch = dyn_cast<BranchInst>(&inst);
+                if (branch->isUnconditional()) {}
+                else {
+                  // Send condition
+                  produceArgs[1] = builder.getInt32(
+                    syncArrays[std::make_tuple(&inst, toStage, DAGEdge::Type::PHI)]);
+                  Value* cond = branch->getCondition();
+                  Value* newCond = mapper.mapValue(*cond);
+                  produceArgs[3] = CastInst::CreateZExtOrBitCast(
+                      newCond, Type::getInt64Ty(M.getContext()), "", copy);
+                  CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
+                                   "", copy);
+                }
               }
               if (edgeTypes.find(DAGEdge::Type::PHISelf) != edgeTypes.end()) {
                 LLVM_DEBUG(dbgs() << "Ignoring phi self edge in code-gen");
               }
             }
           }
+          if (&inst == loop->getLoopLatch()->getTerminator()) {
+            for (int syncArray : extraLatchArrays) {
+              //syncArrayRepls[syncArray] == 1
+              Value* cond;
+              if (BranchInst* branch = dyn_cast<BranchInst>(copy)) {
+                assert(branch->isConditional()
+                  && "Control dependence from unconditional branch");
+                cond = branch->getCondition();
+              } else if (SwitchInst* swtch = dyn_cast<SwitchInst>(copy)) {
+                cond = swtch->getCondition();
+              } else {
+                assert(false && "Loop latch terminator is neither branch nor switch");
+              }
+              Value* newCond = mapper.mapValue(*cond);
+              std::vector<Value*> produceArgs =
+                {arrays, builder.getInt32(syncArray),
+                  syncArrayRepls[syncArray] != 1 ? iterMod
+                                                 : (Value*) builder.getInt32(0),
+                  CastInst::CreateZExtOrBitCast(newCond,
+                      Type::getInt64Ty(M.getContext()), "", copy)};
+              CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
+                               "", copy);
+            }
+            latchEmitted = true;
+            assert(nodeRepls[n] == 1 && "Latch stage is parallel");
+          }
         } else {
           auto f = dependences.find(&inst);
           if (f == dependences.end()) {
             // Ignore the instruction unless it's a terminator
             if (inst.isTerminator()) {
-              if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
-              // For unconditional branches, just emit them and remap them
+              if (&inst == loop->getLoopLatch()->getTerminator()) {
+                // We treat the loop's latch differently since it must be
+                // emitted in all stages
+                Value* cond;
+
+                if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+                  cond = branch->getCondition();
+                } else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
+                  cond = swtch->getCondition();
+                } else {
+                  assert(false
+                    && "Loop latch's terminator is not a branch or switch");
+                }
+
+                if (vmap.find(cond) == vmap.end()) {
+                  int syncArrayNum = numSyncArrays++;
+                  // NOTE: This code assumes the node containing the latch is
+                  // sequential
+                  assert(!latchEmitted && "Latch stage already emitted");
+                  extraLatchArrays.push_back(syncArrayNum);
+                  syncArrayRepls.push_back(nodeRepls[n]);
+                  syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Control)] = syncArrayNum;
+                  ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                     instance};
+                  CallInst* consumeInst
+                    = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+                  Value* newCond = truncateAndCast(builder, M, consumeInst,
+                                              Type::getInt1Ty(M.getContext()),
+                                              "");
+                  vmap[cond] = newCond;
+                }
+                Instruction* copy = inst.clone();
+                toRemap.push_back(copy);
+                builder.Insert(copy);
+              } else if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+                // For unconditional branches, just emit them and remap them
                 if (branch->isUnconditional()) {
                   Instruction* copy = inst.clone();
                   builder.Insert(copy);
@@ -1743,11 +1823,36 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
 
               const BranchInst* branch = dyn_cast<BranchInst>(&inst);
               assert(branch && "PHI dependence from non-branch instruction");
-              assert(branch->isUnconditional()
-                && "PHI dependences from conditional branches not handled");
-              Instruction* copy = inst.clone();
-              toRemap.push_back(copy);
-              builder.Insert(copy);
+              if (branch->isUnconditional()) {
+                Instruction* copy = inst.clone();
+                toRemap.push_back(copy);
+                builder.Insert(copy);
+              } else {
+                Value* cond = branch->getCondition();
+                if (vmap.find(cond) == vmap.end()) {
+                  int syncArrayNum = numSyncArrays++;
+                  syncArrayRepls.push_back(fromReplControl == 1
+                                            ? nodeRepls[n]
+                                            : fromReplControl);
+                  syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Control)]
+                      = syncArrayNum;
+                  ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
+                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
+                                                      fromReplControl == 1
+                                                        ? (Value*) instance
+                                                        : (Value*) iterCounter};
+                  CallInst* consumeInst
+                    = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
+                  Value* newCond = truncateAndCast(builder, M, consumeInst,
+                                                Type::getInt1Ty(M.getContext()),
+                                                "");
+                  vmap[cond] = newCond;
+                }
+
+                Instruction* copy = inst.clone();
+                toRemap.push_back(copy);
+                builder.Insert(copy);
+              }
             }
           }
         }
