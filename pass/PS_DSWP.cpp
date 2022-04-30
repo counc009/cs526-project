@@ -660,6 +660,16 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
     }
   }
 
+  // Make sure that every instruction has an edge from the latch terminator
+  Instruction* latchInst = loop->getLoopLatch()->getTerminator();
+  int latchNode = nodes[latchInst];
+  for (auto [inst, n] : nodes) {
+    if (inst != loop->getLoopLatch()->getTerminator()
+        && !graph.hasEdge(latchNode, n))
+      graph.addEdge(latchNode, n,
+        PDGEdge(PDGEdge::Type::Control, false, latchInst, inst));
+  }
+
   return graph;
 }
 
@@ -1338,9 +1348,6 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     assert(n == 0 && "Failed to construct topological sort");
   }
 
-  std::vector<int> extraLatchArrays;
-  bool latchEmitted = false;
-
   // We emit a function for each stage, it takes a struct containing all values
   // we use defined outside of the loop and the index of this instance
   // Traversing in reverse-topological order
@@ -1508,7 +1515,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
           // after the latest phi for phi's
           if (PHINode* phi = dyn_cast<PHINode>(copy)) {
             if (lastPHI) copy->insertAfter(lastPHI);
-            else builder.Insert(copy);
+            else newBB->getInstList().push_front(copy);
             lastPHI = phi;
           } else {
             builder.Insert(copy);
@@ -1590,73 +1597,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               }
             }
           }
-          if (&inst == loop->getLoopLatch()->getTerminator()) {
-            for (int syncArray : extraLatchArrays) {
-              //syncArrayRepls[syncArray] == 1
-              Value* cond;
-              if (BranchInst* branch = dyn_cast<BranchInst>(copy)) {
-                assert(branch->isConditional()
-                  && "Control dependence from unconditional branch");
-                cond = branch->getCondition();
-              } else if (SwitchInst* swtch = dyn_cast<SwitchInst>(copy)) {
-                cond = swtch->getCondition();
-              } else {
-                assert(false && "Loop latch terminator is neither branch nor switch");
-              }
-              Value* newCond = mapper.mapValue(*cond);
-              std::vector<Value*> produceArgs =
-                {arrays, builder.getInt32(syncArray),
-                  syncArrayRepls[syncArray] != 1 ? iterMod
-                                                 : (Value*) builder.getInt32(0),
-                  CastInst::CreateZExtOrBitCast(newCond,
-                      Type::getInt64Ty(M.getContext()), "", copy)};
-              CallInst::Create(psdswp.produce, ArrayRef<Value*>(produceArgs),
-                               "", copy);
-            }
-            latchEmitted = true;
-            assert(nodeRepls[n] == 1 && "Latch stage is parallel");
-          }
         } else {
           auto f = dependences.find(&inst);
           if (f == dependences.end()) {
             // Ignore the instruction unless it's a terminator
             if (inst.isTerminator()) {
-              if (&inst == loop->getLoopLatch()->getTerminator()) {
-                // We treat the loop's latch differently since it must be
-                // emitted in all stages
-                Value* cond;
-
-                if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
-                  cond = branch->getCondition();
-                } else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
-                  cond = swtch->getCondition();
-                } else {
-                  assert(false
-                    && "Loop latch's terminator is not a branch or switch");
-                }
-
-                if (vmap.find(cond) == vmap.end()) {
-                  int syncArrayNum = numSyncArrays++;
-                  // NOTE: This code assumes the node containing the latch is
-                  // sequential
-                  assert(!latchEmitted && "Latch stage already emitted");
-                  extraLatchArrays.push_back(syncArrayNum);
-                  syncArrayRepls.push_back(nodeRepls[n]);
-                  syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Control)] = syncArrayNum;
-                  ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
-                  std::vector<Value*> consumeArgs = {arrays, syncArrayArg,
-                                                     instance};
-                  CallInst* consumeInst
-                    = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
-                  Value* newCond = truncateAndCast(builder, M, consumeInst,
-                                              Type::getInt1Ty(M.getContext()),
-                                              "");
-                  vmap[cond] = newCond;
-                }
-                Instruction* copy = inst.clone();
-                toRemap.push_back(copy);
-                builder.Insert(copy);
-              } else if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+              if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
                 // For unconditional branches, just emit them and remap them
                 if (branch->isUnconditional()) {
                   Instruction* copy = inst.clone();
@@ -1807,7 +1753,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                 CallInst* consumeInst
                   = builder.CreateCall(psdswp.consume, ArrayRef<Value*>(consumeArgs));
                 Value* newCond = truncateAndCast(builder, M, consumeInst,
-                                              Type::getInt1Ty(M.getContext()),
+                                              cond->getType(),
                                               "");
                 vmap[cond] = newCond;
               }
@@ -1817,7 +1763,9 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
               builder.Insert(copy);
             } else if (hasPhiDependence) {
               // If we insert the branch (because of a control dependence)
-              // we don't need to handle the PHI specially anymore
+              // we don't need to handle the PHI specially anymore, since the
+              // way we handle it is just to insert the branch like a control
+              // dependence
               assert((nodeRepls[n] == 1 || fromReplPhi == 1)
                   && "Communication between parallel stages not supported");
 
@@ -1833,7 +1781,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                   int syncArrayNum = numSyncArrays++;
                   syncArrayRepls.push_back(fromReplControl == 1
                                             ? nodeRepls[n]
-                                            : fromReplControl);
+                                            : fromReplPhi);
                   syncArrays[std::make_tuple(&inst, n, DAGEdge::Type::Control)]
                       = syncArrayNum;
                   ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
@@ -1956,6 +1904,10 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   std::vector<Value*> createArgs;
   createArgs.push_back(builder.getInt32(numSyncArrays));
   for (int repl : syncArrayRepls) {
+    if (repl <= 0) {
+      errs() << "syncArray repl error\n";
+      abort();
+    }
     createArgs.push_back(builder.getInt32(repl));
   }
   CallInst* syncArray =
