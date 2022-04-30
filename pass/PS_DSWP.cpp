@@ -1588,12 +1588,16 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                  "", copy);
               } else if (edgeTypes.find(DAGEdge::Type::PHI) != edgeTypes.end()) {
                 const BranchInst* branch = dyn_cast<BranchInst>(&inst);
-                if (branch->isUnconditional()) {}
+                if (branch && branch->isUnconditional()) {}
                 else {
                   // Send condition
                   produceArgs[1] = builder.getInt32(
                     syncArrays[std::make_tuple(&inst, toStage, DAGEdge::Type::PHI)]);
-                  Value* cond = branch->getCondition();
+                  Value* cond;
+                  if (branch) { cond = branch->getCondition(); }
+                  else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
+                    cond = swtch->getCondition();
+                  }
                   Value* newCond = mapper.mapValue(*cond);
                   produceArgs[3] = CastInst::CreateZExtOrBitCast(
                       newCond, Type::getInt64Ty(M.getContext()), "", copy);
@@ -1779,13 +1783,19 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                   && "Communication between parallel stages not supported");
 
               const BranchInst* branch = dyn_cast<BranchInst>(&inst);
-              assert(branch && "PHI dependence from non-branch instruction");
-              if (branch->isUnconditional()) {
+              if (branch && branch->isUnconditional()) {
                 Instruction* copy = inst.clone();
                 toRemap.push_back(copy);
                 builder.Insert(copy);
               } else {
-                Value* cond = branch->getCondition();
+                Value* cond;
+                if (const BranchInst* branch = dyn_cast<BranchInst>(&inst)) {
+                  cond = branch->getCondition();
+                } else if (const SwitchInst* swtch = dyn_cast<SwitchInst>(&inst)) {
+                  cond = swtch->getCondition();
+                } else {
+                  assert(false && "PHI dependence from non branch or switch");
+                }
                 if (vmap.find(cond) == vmap.end()) {
                   int syncArrayNum = numSyncArrays++;
                   syncArrayRepls.push_back(fromReplControl == 1
