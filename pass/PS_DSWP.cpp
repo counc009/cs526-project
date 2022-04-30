@@ -178,11 +178,19 @@ namespace {
       PostDominatorTree PDT(F); // Note: PDT.dominates(A, B) <=> A postdom B
 
       std::vector<WorkObject> worklist;
-      std::set<BasicBlock*> visited;
+      std::set<BasicBlock*> visited, inserted;
 
-      for (BasicBlock* BB : PDT.roots()) {
+      if (PDT.getRootNode()->getBlock()) {
+        BasicBlock* BB = PDT.getRootNode()->getBlock();
         DomTreeNodeBase<BasicBlock>* Node = PDT[BB];
         worklist.push_back(WorkObject(BB, nullptr, Node, nullptr));
+        inserted.insert(BB);
+      } else {
+        for (DomTreeNodeBase<BasicBlock>* Node : PDT.getRootNode()->children()) {
+          BasicBlock* BB = Node->getBlock();
+          worklist.push_back(WorkObject(BB, nullptr, Node, nullptr));
+          inserted.insert(BB);
+        }
       }
 
       do {
@@ -214,8 +222,9 @@ namespace {
              NI != NE; ++NI) {
           DomTreeNodeBase<BasicBlock>* IDominee = *NI;
           BasicBlock* childBB = IDominee->getBlock();
-          if (visited.count(childBB) == 0) {
+          if (inserted.count(childBB) == 0) {
             worklist.push_back(WorkObject(childBB, currentBB, IDominee, currentNode));
+            inserted.insert(childBB);
             visitChild = true;
           }
         }
@@ -223,13 +232,13 @@ namespace {
         // If all children are visited or there is any child then pop this block
         // from the worklist.
         if (!visitChild) {
-          if (!parentBB) break;
-
-          auto CDFI = S.begin(), CDFE = S.end();
-          auto& parentSet = RDF[parentBB];
-          for (; CDFI != CDFE; ++CDFI) {
-            if (!PDT.properlyDominates(parentNode, PDT[*CDFI]))
-              parentSet.insert(*CDFI);
+          if (parentBB) {
+            auto CDFI = S.begin(), CDFE = S.end();
+            auto& parentSet = RDF[parentBB];
+            for (; CDFI != CDFE; ++CDFI) {
+              if (!PDT.properlyDominates(parentNode, PDT[*CDFI]))
+                parentSet.insert(*CDFI);
+            }
           }
           worklist.pop_back();
         }
