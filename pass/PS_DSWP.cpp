@@ -63,7 +63,10 @@ namespace {
     PDGNode(Instruction* i) : inst(i) {}
   };
   struct PDGEdge {
-    enum Type { Register, Memory, Control, PHI, PHISelf };
+    // Self edges are used for instructions that (for whatever reason) has to
+    // be in a sequential stage. For instance, a PHI taking a value from the
+    // back edge
+    enum Type { Register, Memory, Control, PHI, Self };
     Type dependence;
     bool loopCarried;
     Instruction *src, *dst;
@@ -590,6 +593,12 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
             LLVM_DEBUG(
               dbgs() << "[psdswp] Register dependence from " << inst << " to "
                      << *useInst << (carried ? " (loop carried)\n" : "\n"));
+          } else if (!loop->contains(useInst)) {
+            // NOTE: Since we currently don't support live-outs from DOALL,
+            // add a self edge to live-outs
+            graph.addEdge(node, node, PDGEdge(PDGEdge::Self, true, &inst, &inst));
+            LLVM_DEBUG(
+              dbgs() << "[psdswp] Self dependence for live-out: " << inst << "\n");
           }
         }
       }
@@ -617,7 +626,7 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
           // and so this cannot be placed in a parallel stage
           if (bb == backedge) {
             graph.addEdge(node, node,
-                PDGEdge(PDGEdge::PHISelf, true, phi, phi));
+                PDGEdge(PDGEdge::Self, true, phi, phi));
             LLVM_DEBUG(
               dbgs() << "[psdswp] PHI self dependence on " << *phi << "\n");
           }
@@ -1605,8 +1614,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                                    "", copy);
                 }
               }
-              if (edgeTypes.find(DAGEdge::Type::PHISelf) != edgeTypes.end()) {
-                LLVM_DEBUG(dbgs() << "Ignoring phi self edge in code-gen");
+              if (edgeTypes.find(DAGEdge::Type::Self) != edgeTypes.end()) {
+                LLVM_DEBUG(dbgs() << "Ignoring self edge in code-gen");
               }
             }
           }
@@ -1696,8 +1705,8 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
                   hasPhiDependence = true;
                   fromReplPhi = nodeRepls[pair.first];
                   break; }
-                case DAGEdge::Type::PHISelf: {
-                  LLVM_DEBUG(dbgs() << "Ignoring phi self edge");
+                case DAGEdge::Type::Self: {
+                  LLVM_DEBUG(dbgs() << "Ignoring self edge");
                   break; }
               }
             }
