@@ -726,7 +726,7 @@ static DAG connectEdges(PDG graph, DAG dag_scc, std::map<int, std::vector<int>> 
 
 
 static void strongconnect(int u, int disc[], int low[], std::stack<int> *st,
-					bool stackMember[], PDG graph, DAG &dag_scc, std::map<int, std::vector<int>> &scc_to_pdg_map, std::map<int, int> &pdg_to_scc_map)
+					bool stackMember[], PDG& graph, DAG &dag_scc, std::map<int, std::vector<int>> &scc_to_pdg_map, std::map<int, int> &pdg_to_scc_map)
 {
 	
 	static int time = 0;
