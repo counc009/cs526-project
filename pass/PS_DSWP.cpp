@@ -1518,7 +1518,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     for (const BasicBlock* bb : loop->blocks()) {
       BasicBlock* newBB = BasicBlock::Create(M.getContext(), bb->getName(), func);
       vmap[bb] = newBB;
-      IRBuilder<> builder(newBB);
+      IRBuilder builder(newBB);
       // Track the most recent phi's position so we can insert the next phi directly
       // after it (not after any produce calls it may have generated, since LLVM
       // doesn't allow that)
@@ -1854,7 +1854,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
     Instruction* latch = loop->getLoopLatch()->getTerminator();
     if (nodeRepls[n] != 1) {
       int syncArrayNum = syncArrays[std::make_tuple(latch, n, DAGEdge::Type::Control)];
-      IRBuilder<> builder(entry);
+      IRBuilder builder(entry);
       ConstantInt* syncArrayArg = builder.getInt32(syncArrayNum);
       std::vector<Value*> consumeArgs = {arrays, syncArrayArg, instance};
       CallInst* consumeInst
@@ -1873,12 +1873,12 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
       builder.Insert(branch);
     } else {
       // For sequential stages just jump directly to the loop
-      IRBuilder<> builder(entry);
+      IRBuilder builder(entry);
       builder.CreateBr(static_cast<BasicBlock*>(mapper.mapValue(*loop->getHeader())));
     }
 
     // Add communication of live outs
-    IRBuilder<> builder(exit);
+    IRBuilder builder(exit);
     for (Instruction* inst : node.insts) {
       auto f = liveOuts.find(inst);
       if (f == liveOuts.end()) continue;
@@ -1914,7 +1914,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   BasicBlock* newLoop = BasicBlock::Create(M.getContext(), "loop.par", &F);
   // Block for getting live-outs
   BasicBlock* liveOutConsumes = BasicBlock::Create(M.getContext(), "loop.outs", &F);
-  IRBuilder<> builder(newLoop);
+  IRBuilder builder(newLoop);
   assert(loop->getLoopPreheader() && "Loop doesn't have a pre-header");
   assert(loop->getExitBlock() && "Loop doesn't have unique exit block");
   BranchInst* branch = dyn_cast<BranchInst>(loop->getLoopPreheader()->getTerminator());
@@ -1924,7 +1924,7 @@ static bool performParallelization(PS_DSWP& psdswp, DAG partition, Loop* loop,
   // Add branch to the exit block, and set the builder to insert before it
   builder.SetInsertPoint(BranchInst::Create(liveOutConsumes, newLoop));
 
-  IRBuilder<> outsBuilder(liveOutConsumes);
+  IRBuilder outsBuilder(liveOutConsumes);
   outsBuilder.SetInsertPoint(BranchInst::Create(loop->getExitBlock(), liveOutConsumes));
 
   // To launch the pipeline:
