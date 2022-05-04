@@ -2,6 +2,7 @@ import glob
 import subprocess
 from tqdm import tqdm
 import sys
+import time
 
 reps = 1000
 repsValgrind = 10
@@ -13,12 +14,16 @@ references = map(lambda nm: nm.replace('.exec', '.ref'), executables)
 
 for ex, ref in zip(executables, references):
   print('Testing', ex)
-  refProc = subprocess.Popen([ref, argN, argSeed], stdout=subprocess.PIPE)
-  refResult = refProc.communicate()[0]
-  if refProc.returncode != 0:
-    print('Reference returned non-0, exiting')
-    sys.exit(1)
+  #start_time = time.time()
+  for i in tqdm(range(reps)):
+    refProc = subprocess.Popen([ref, argN, argSeed], stdout=subprocess.PIPE)
+    refResult = refProc.communicate()[0]
+		#print("Reference Run %s seconds ---" % (time.time() - start_time))
+    if refProc.returncode != 0:
+      print('Reference returned non-0, exiting')
+      sys.exit(1)
 
+  #start_time = time.time()
   for i in tqdm(range(reps)):
     execProc = subprocess.Popen([ex, argN, argSeed], stdout=subprocess.PIPE)
     execResult = execProc.communicate()[0]
@@ -28,6 +33,9 @@ for ex, ref in zip(executables, references):
     if execResult != refResult:
       print('Executable produced different output, failed')
       sys.exit(1)
+  #elapsed = time.time() - start_time
+  #print("Exec Run for all reps %s seconds ---" % (elapsed))
+  #print("Average time taken ---- %s seconds " % (elapsed/reps) )
   for i in tqdm(range(repsValgrind)):
     execProc = subprocess.Popen(['valgrind', ex, argN, argSeed],
                                 stdout=subprocess.PIPE,
