@@ -1,0 +1,3 @@
+#!/bin/sh
+
+cat prof.$1.pn* | sort | awk -f collect.awk > prof.$1.all

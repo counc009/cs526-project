@@ -10,7 +10,7 @@ EXECS = $(addsuffix .exec, $(basename $(SOURCES)))
 REFS = $(addsuffix .ref, $(basename $(SOURCES)))
 
 PRE_PSDSWP_FLAGS = -sccp -simplifycfg -loop-simplify
-PSDSWP_FLAGS = -enable-new-pm=0 -load ../build/pass/libPS-DSWP.so -tbaa -psdswp -debug
+PSDSWP_FLAGS = -enable-new-pm=0 -load ../build/pass/libPS-DSWP.so -tbaa -psdswp -stats
 
 all: exec refs
 exec: $(EXECS)

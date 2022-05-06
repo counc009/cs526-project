@@ -1,0 +1,29 @@
+Olden v1.01 runtime system
+
+Martin C. Carlisle
+June 1996
+
+see COPYRIGHT notice in olden_v1.01/COPYRIGHT
+
+files:
+Makefile - to use visualization, uncomment -DVISUALIZE
+accumulate - sums profiling information from multiple processors into
+             single total (input: prof.{job id}.pn[0-num_pes]
+                           output: prof.{job id}.all)
+affinity.h - macros for having profiler compute affinities
+cache.[ch],cache_asm.asm, cache_handlers.c - caching routines
+collect.awk - used by accumulate
+constants.h 
+debug.c - debugging routines
+future-cell.h, future.asm - code for FUTUREs.
+init.c - initialization/shutdown routines
+mccvis.asm - interface routines for Olden visualization
+mem-ref.h - standard header file for Olden programs
+mem.c - mymalloc routines
+migrate.[ch],migrate_asm.asm - migration routines
+msg.[ch],msg2.c - core of runtime system
+plain-mem.c,plain.c,plain2.asm - used for plain versions of Olden programs
+prof.c,prof_asm.asm - routines used to collect profiling information
+registers.h - header file for Olden reserved registers
+stack.asm,stack_frame.h - stack routines
+threads.h - header file for blocked threads
