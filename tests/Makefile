@@ -3,7 +3,7 @@ OPT = opt
 
 NUM_THREADS = 8
 
-SOURCES = $(wildcard array/*.c linked_list/*.c)
+SOURCES = $(wildcard array/*.c linked_list/*.c tree/*.c nested_array/*.c nested_list/*.c)
 OPTS = $(addsuffix .opt.ll, $(basename $(SOURCES)))
 PARS = $(addsuffix .par.ll, $(basename $(SOURCES)))
 EXECS = $(addsuffix .exec, $(basename $(SOURCES)))
@@ -27,7 +27,7 @@ array/%.opt.ll: array/%.ll
 array/%.par.ll: array/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
-array/%.ref: array/%.opt.ll test_array.ll psdswp.ll
+array/%.ref: array/%.opt.ll test_array.ll
 	$(CLANG) -O3 $^ -o $@
 
 array/%.exec: array/%.par.ll test_array.ll psdswp.ll
@@ -39,7 +39,7 @@ linked_list/%.opt.ll: linked_list/%.ll
 linked_list/%.par.ll: linked_list/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node $^ -S -o $@
 
-linked_list/%.ref: linked_list/%.opt.ll test_list.ll psdswp.ll
+linked_list/%.ref: linked_list/%.opt.ll test_list.ll
 	$(CLANG) -O3 $^ -o $@
 
 linked_list/%.exec: linked_list/%.par.ll test_list.ll psdswp.ll
@@ -51,19 +51,38 @@ tree/%.opt.ll: tree/%.ll
 tree/%.par.ll: tree/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
-tree/%.ref: tree/%.opt.ll test_tree.ll psdswp.ll
+tree/%.ref: tree/%.opt.ll test_tree.ll
 	$(CLANG) -O3 $^ -o $@
 
 tree/%.exec: tree/%.par.ll test_tree.ll psdswp.ll
 	$(CLANG) -O3 $^ -o $@
 
+nested_array/%.opt.ll: nested_array/%.ll
+	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
+
+nested_array/%.par.ll: nested_array/%.opt.ll
+	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
+
+nested_array/%.ref: nested_array/%.opt.ll test_nested_array.ll
+	$(CLANG) -O3 $^ -o $@
+
+nested_array/%.exec: nested_array/%.par.ll test_nested_array.ll psdswp.ll
+	$(CLANG) -O3 $^ -o $@
+
+nested_list/%.opt.ll: nested_list/%.ll
+	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
+
+nested_list/%.par.ll: nested_list/%.opt.ll
+	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node -asll=lnode $^ -S -o $@
+
+nested_list/%.ref: nested_list/%.opt.ll test_nested_list.ll
+	$(CLANG) -O3 $^ -o $@
+
+nested_list/%.exec: nested_list/%.par.ll test_nested_list.ll psdswp.ll
+	$(CLANG) -O3 $^ -o $@
+
 clean:
 	rm -rf *.ll *.exec *.ref */*.ll */*.exec */*.ref
 
-# Build the executables that are currently working
-working: array/increment.ref array/increment.exec array/incdec.ref array/incdec.exec array/incdecnext.ref array/incdecnext.exec array/incdecprev.ref array/incdecprev.exec array/squarenons.ref array/squarenons.exec array/runningsum.ref array/runningsum.exec array/sum.ref array/sum.exec linked_list/increment.ref linked_list/increment.exec linked_list/incdec.ref linked_list/incdec.exec linked_list/incdecnext.ref linked_list/incdecnext.exec linked_list/incdecprev.ref linked_list/incdecprev.exec linked_list/squarenons.ref linked_list/squarenons.exec linked_list/runningsum.ref linked_list/runningsum.exec linked_list/sum.ref linked_list/sum.exec
-
-trees: tree/increment.ref tree/increment.exec tree/incdec.ref tree/incdec.exec tree/squarenons.ref tree/squarenons.exec
-
-.PHONY: clean working trees
+.PHONY: clean all
 .PRECIOUS: %.ll

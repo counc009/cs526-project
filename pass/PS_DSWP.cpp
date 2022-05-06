@@ -173,9 +173,9 @@ namespace {
   // Forward Dominance Frontiers
   class ReverseDominanceFrontier {
   private:
-    std::map<BasicBlock*, std::set<const BasicBlock*>> RDF;
+    std::map<const BasicBlock*, std::set<const BasicBlock*>> RDF;
   public:
-    std::set<const BasicBlock*> rdf(BasicBlock* bb) { return RDF[bb]; }
+    std::set<const BasicBlock*> rdf(const BasicBlock* bb) { return RDF[bb]; }
 
     ReverseDominanceFrontier(Function& F) {
       PostDominatorTree PDT(F); // Note: PDT.dominates(A, B) <=> A postdom B
@@ -655,7 +655,15 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
   // Use Reverse Dominance Frontier to get the control dependences
   // (specifically if X in RDF(Y) then Y is control dependent on X
   for (BasicBlock* bb : loop->blocks()) {
-    for (const BasicBlock* b : RDF.rdf(bb)) {
+    std::set<const BasicBlock*> handled;
+    std::queue<const BasicBlock*> worklist;
+    for (const BasicBlock* b : RDF.rdf(bb)) worklist.push(b);
+
+    while (!worklist.empty()) {
+      const BasicBlock* b = worklist.front(); worklist.pop();
+      if (handled.find(b) != handled.end()) continue;
+      handled.insert(b);
+
       // This means that bb has a control dependence on b
       //
       // Specifically, therefore, each instruction in bb has a dependence on
@@ -675,6 +683,10 @@ static PDG generatePDG(Loop* loop, LoopInfo& LI, DependenceInfo& DI,
                    << (loopCarried ? " (loop carried)\n" : "\n"));
         }
       }
+
+      // Also add control dependencies from the basic block that these basic
+      // blocks (the ones it always depends on) depend on
+      for (const BasicBlock* block : RDF.rdf(b)) worklist.push(block);
     }
   }
 
