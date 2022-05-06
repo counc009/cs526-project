@@ -14,8 +14,8 @@ executables = glob.glob('./*/*.exec')
 references = map(lambda nm: nm.replace('.exec', '.ref'), executables)
 
 for ex, ref in zip(executables, references):
-  # Skip large tests
-  if ex.startswith('./large_tests'):
+  # Skip large tests and Olden
+  if ex.startswith('./large_tests') or ex.startswith('./olden'):
     continue
 
   args = [argN, argSeed]
@@ -41,7 +41,9 @@ for ex, ref in zip(executables, references):
       print('Executable produced different output, failed')
       sys.exit(1)
   for i in tqdm(range(repsValgrind)):
-    execProc = subprocess.Popen(['valgrind', ex] + args,
+    # Flags cause valgrind to return 1 if there are any leaks
+    execProc = subprocess.Popen(['valgrind', '--error-exitcode=1',
+                                 '--leak-check=full', ex] + args,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
     execResult = execProc.communicate()[0]
