@@ -28,10 +28,10 @@ array/%.par.ll: array/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
 array/%.ref: array/%.opt.ll test_array.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 array/%.exec: array/%.par.ll test_array.ll psdswp.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 linked_list/%.opt.ll: linked_list/%.ll
 	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
@@ -40,10 +40,10 @@ linked_list/%.par.ll: linked_list/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node $^ -S -o $@
 
 linked_list/%.ref: linked_list/%.opt.ll test_list.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 linked_list/%.exec: linked_list/%.par.ll test_list.ll psdswp.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 tree/%.opt.ll: tree/%.ll
 	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
@@ -52,10 +52,10 @@ tree/%.par.ll: tree/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
 tree/%.ref: tree/%.opt.ll test_tree.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 tree/%.exec: tree/%.par.ll test_tree.ll psdswp.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 nested_array/%.opt.ll: nested_array/%.ll
 	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
@@ -64,10 +64,10 @@ nested_array/%.par.ll: nested_array/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) $^ -S -o $@
 
 nested_array/%.ref: nested_array/%.opt.ll test_nested_array.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 nested_array/%.exec: nested_array/%.par.ll test_nested_array.ll psdswp.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 nested_list/%.opt.ll: nested_list/%.ll
 	$(OPT) $(PRE_PSDSWP_FLAGS) $^ -S -o $@
@@ -76,10 +76,10 @@ nested_list/%.par.ll: nested_list/%.opt.ll
 	$(OPT) $(PSDSWP_FLAGS) -num-threads=$(NUM_THREADS) -asll=node -asll=lnode $^ -S -o $@
 
 nested_list/%.ref: nested_list/%.opt.ll test_nested_list.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 nested_list/%.exec: nested_list/%.par.ll test_nested_list.ll psdswp.ll
-	$(CLANG) -O3 $^ -o $@
+	$(CLANG) -O3 $^ -o $@ -lpthread
 
 clean:
 	rm -rf *.ll *.exec *.ref */*.ll */*.exec */*.ref

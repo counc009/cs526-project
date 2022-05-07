@@ -6,5 +6,5 @@ set -e
 clang -c -emit-llvm -O1 gcc.c -o gcc.bc
 opt -sccp -simplifycfg -loop-simplify gcc.bc -o gcc.opt.bc
 opt -load ../../build/pass/libPS-DSWP.so -enable-new-pm=0 -tbaa -psdswp -num-threads=8 gcc.opt.bc -o gcc.par.bc
-clang -O3 gcc.par.bc ../psdswp.ll -o gcc.exec
-clang -O3 gcc.opt.bc -o gcc.ref
+clang -O3 gcc.par.bc ../psdswp.ll -o gcc.exec -lpthread
+clang -O3 gcc.opt.bc -o gcc.ref -lpthread
