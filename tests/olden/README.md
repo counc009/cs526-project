@@ -19,3 +19,4 @@ with our pass due to use of vector and struct typed virtual registers.
 | voronoi | computes Voronoi diagram of a set of points |  We successfully compile, having parallelized 6 loops |
 
 
+If you are planning to build and execute, please ensure paths to CLANG, OPT and other object files are correctly provided to the build paths
